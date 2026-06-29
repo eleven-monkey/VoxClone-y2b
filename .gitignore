@@ -46,3 +46,7 @@ cookies.txt
 
 # API 配置（含密钥时）
 api_config.local.json
+
+# 参考脚本（Colab 调试用，不进仓库）
+moss_tts_demo.py
+wshiperx说话人识别asr.py
