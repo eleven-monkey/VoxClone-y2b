@@ -82,6 +82,8 @@ jobs:
       - name: 安装 ASR 依赖
         run: |
           pip install -r requirements/common.txt
+          # 参考 wshiperx colab 脚本：先装 torch CPU 版，再装 whisperx，避免 torchaudio 版本冲突
+          pip install torch>=2.1,<2.6 torchaudio>=2.1,<2.6 --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements/asr.txt
 
       - name: 下载音频
