@@ -205,7 +205,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-tts-${{ runner.os }}-py3.10-${{ hashFiles('requirements/tts.txt', 'requirements/common.txt') }}
+          key: pip-tts-${{ runner.os }}-py3.10-sf-${{ hashFiles('requirements/tts.txt', 'requirements/common.txt') }}
 
       - name: 缓存 MOSS-TTS-Nano 仓库
         id: cache-moss

@@ -36,8 +36,40 @@ def parse_subtitle(file_path):
     return split_text_by_timestamp(content)
 
 
+def _patch_torchaudio_for_cpu():
+    """monkey-patch torchaudio.load 用 soundfile 后端，绕开 torchcodec 的 CUDA 依赖。
+
+    torchaudio 2.5+ 默认走 torchcodec 后端，在纯 CPU 环境（无 libnvrtc.so）
+    会报 OSError。soundfile + libsndfile 是纯 CPU 的稳定方案。
+    """
+    import torchaudio
+    import soundfile as sf
+    import torch
+    import warnings
+
+    if getattr(torchaudio, "_voxclone_patched", False):
+        return
+
+    def _load_with_soundfile(filepath, **kwargs):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data, sr = sf.read(str(filepath), always_2d=True, dtype="float32")
+        # data shape: (samples, channels) → tensor (channels, samples)
+        waveform = torch.from_numpy(data).T
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        return waveform, sr
+
+    torchaudio.load = _load_with_soundfile
+    torchaudio._voxclone_patched = True
+    print("[patch] torchaudio.load 已替换为 soundfile 后端（绕开 torchcodec）")
+
+
 def build_moss_runtime(moss_tts_dir):
     """加载 moss-tts ONNX runtime（只加载一次）。"""
+    # 在 import moss-tts 之前 patch，确保 moss-tts 调用 torchaudio.load 时走 soundfile
+    _patch_torchaudio_for_cpu()
+
     if moss_tts_dir and os.path.isdir(moss_tts_dir):
         sys.path.insert(0, os.path.abspath(moss_tts_dir))
     try:
