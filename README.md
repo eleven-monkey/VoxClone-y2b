@@ -1,4 +1,6 @@
-# YouTube 视频翻译配音搬运（语音克隆版）
+# VoxClone-y2b
+
+YouTube 视频翻译配音搬运（语音克隆版）
 
 基于 GitHub Actions 的 YouTube 多人谈话节目翻译配音搬运工具。手动触发工作流后自动完成：
 **下载音频 → WhisperX 转写 + 说话人分离 → 自动截取每位说话人参考音 → LLM 翻译字幕为中文 → moss-tts 语音克隆逐句配音 → 替换原音轨 → 上传 B 站**。
