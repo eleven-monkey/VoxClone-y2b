@@ -284,11 +284,12 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.work_dir, exist_ok=True)
-    os.chdir(args.work_dir)
-
-    if not os.path.exists(args.audio_path):
-        print(f"错误: 找不到配音音频 {args.audio_path}")
+    # chdir 之前把音频路径转绝对路径，否则 chdir 后相对路径失效
+    audio_path_abs = os.path.abspath(args.audio_path)
+    if not os.path.exists(audio_path_abs):
+        print(f"错误: 找不到配音音频 {audio_path_abs}")
         return 1
+    os.chdir(args.work_dir)
 
     api_config = load_api_config(args.api_config)
     cookies_file = args.cookies if (args.cookies and os.path.exists(args.cookies)) else None
@@ -313,7 +314,7 @@ def main():
 
     # 3. 替换音轨
     final_video = "final_video.mp4"
-    if not replace_audio_track(video_path, args.audio_path, final_video):
+    if not replace_audio_track(video_path, audio_path_abs, final_video):
         print("音轨替换失败")
         return 1
 

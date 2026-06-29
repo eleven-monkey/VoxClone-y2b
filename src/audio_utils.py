@@ -43,40 +43,35 @@ def parse_timestamp(timestamp):
 
 
 def split_text_by_timestamp(text):
-    """按时间戳分割文本。
+    """解析带时间戳和说话人标签的字幕。
 
-    支持带说话人标签的格式:
+    支持格式:
         (00:01:23.456) [Speaker 00] 大家好欢迎来到节目
 
+    逐行解析，严格剥离时间戳和说话人标签，只返回纯正文。
     返回: [(timestamp_str, speaker, content), ...]
     其中 timestamp_str 为纯时间戳(无括号)，speaker 为 "Speaker 00" 或空字符串
     """
-    # 时间戳模式
-    ts_pattern = r'[\(（](\d{1,2})?:?(\d{1,3}):(\d{1,2})(?:\.(\d{1,3}))?[\)）]'
-    # 说话人标签模式（可选）
-    speaker_pattern = r'\s*\[([^\]]+)\]\s*'
-    full_pattern = ts_pattern + r'(' + speaker_pattern + r')?(.+?)(?=' + ts_pattern + r'|$)'
+    # 行格式: (时间戳) [Speaker XX] 正文  或  (时间戳) 正文
+    line_pattern = re.compile(
+        r'[\(（](?P<ts>\d{1,2}:\d{2}:\d{2}\.\d{1,3}|\d{1,2}:\d{2}:\d{2}|\d{1,3}:\d{2}(?:\.\d{1,3})?)[\)）]'
+        r'(?:\s*\[(?P<speaker>[^\]]+)\])?'
+        r'\s*(?P<content>.+)'
+    )
 
     segments = []
-    for match in re.finditer(full_pattern, text, re.DOTALL):
-        # 组装时间戳字符串（去括号）
-        h, m, s, ms = match.group(1), match.group(2), match.group(3), match.group(4)
-        ts_parts = []
-        if h:
-            ts_parts.append(f"{int(h):02d}:{int(m):02d}:{int(s):02d}")
-            if ms:
-                ts_parts[-1] += f".{ms.ljust(3, '0')}"
-        else:
-            ts_parts.append(f"{int(m)}:{int(s):02d}")
-            if ms:
-                ts_parts[-1] += f".{ms.ljust(3, '0')}"
-        timestamp_str = ts_parts[0]
-
-        # group(5) 是 [Speaker XX] 捕获内容，group(6) 是正文
-        speaker = match.group(5) or ""
-        content = (match.group(6) or "").strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = line_pattern.match(line)
+        if not m:
+            continue
+        ts = m.group("ts")
+        speaker = (m.group("speaker") or "").strip()
+        content = (m.group("content") or "").strip()
         if content:
-            segments.append((timestamp_str, speaker, content))
+            segments.append((ts, speaker, content))
 
     return segments
 
