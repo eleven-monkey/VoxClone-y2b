@@ -52,10 +52,15 @@ jobs:
         run: pip install -U yt-dlp
 
       - name: 写入 YouTube cookies
-        if: ${{ secrets.YT_COOKIES != '' }}
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          printf '%s' "${{ secrets.YT_COOKIES }}" > youtube_cookies.txt
-          echo "cookies 文件已写入"
+          if [ -n "$YT_COOKIES" ]; then
+            printf '%s' "$YT_COOKIES" > youtube_cookies.txt
+            echo "cookies 文件已写入"
+          else
+            echo "未配置 YT_COOKIES，跳过"
+          fi
 
       - name: 设置 Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
@@ -300,8 +305,12 @@ jobs:
         run: pip install -r requirements/common.txt
 
       - name: 写入 YouTube cookies
-        if: ${{ secrets.YT_COOKIES != '' }}
-        run: printf '%s' "${{ secrets.YT_COOKIES }}" > youtube_cookies.txt
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then
+            printf '%s' "$YT_COOKIES" > youtube_cookies.txt
+          fi
 
       - name: 下载配音产物
         uses: actions/download-artifact@v4
