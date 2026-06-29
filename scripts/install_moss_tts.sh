@@ -21,19 +21,22 @@ conda install -y -c conda-forge "python=3.10"
 echo "=== [3/6] 安装 pynini (conda-forge) ==="
 conda install -y -c conda-forge pynini=2.1.6
 
+# 后续 pip 操作强制使用 conda 的 pip，避免系统 pip(python3.12)污染
+CONDA_PIP="python -m pip"
+
 echo "=== [4/6] 安装 WeTextProcessing (源码) ==="
-pip install git+https://github.com/WhizZest/WeTextProcessing.git || \
+$CONDA_PIP install git+https://github.com/WhizZest/WeTextProcessing.git || \
   echo "警告: WeTextProcessing 安装失败，moss-tts 将使用内置文本规范化"
 
 echo "=== [5/6] 安装 requirements.txt ==="
 sed -i '/WeTextProcessing/d' requirements.txt || true
-pip install -r requirements.txt
+$CONDA_PIP install -r requirements.txt
 
 echo "=== [6/6] editable 安装 moss-tts-nano ==="
-pip install -e .
+$CONDA_PIP install -e .
 
 echo "=== 对齐 torch CPU 版本 ==="
-pip install -U torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+$CONDA_PIP install -U torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 echo "=== 清理可能损坏的 transformers 动态模块缓存 ==="
 rm -rf ~/.cache/huggingface/modules/transformers_modules/OpenMOSS* || true
