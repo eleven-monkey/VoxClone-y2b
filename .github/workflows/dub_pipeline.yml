@@ -77,7 +77,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-models-asr-${{ runner.os }}
+          key: hf-models-asr-pyannote3-${{ runner.os }}
 
       - name: 安装 ASR 依赖
         run: |
