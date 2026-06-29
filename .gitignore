@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.so
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 运行产物
+work/
+work_tts/
+work_upload/
+subtitles/
+audio/
+generated_audio/
+temp_audio/
+*.mp3
+*.mp4
+*.wav
+*.pkl
+
+# moss-tts 本地克隆（CI 中安装）
+MOSS-TTS-Nano/
+models/
+
+# 模型缓存
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# cookies（敏感）
+youtube_cookies.txt
+*_cookies.txt
+cookies.txt
+
+# API 配置（含密钥时）
+api_config.local.json

@@ -1,0 +1,6 @@
+git+https://github.com/m-bain/whisperX.git
+pyannote.audio
+torch
+torchaudio
+numpy<2.1
+pandas<2.4

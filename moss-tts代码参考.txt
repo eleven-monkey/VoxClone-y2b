@@ -1,0 +1,52 @@
+# @title 1. 克隆仓库并安装环境
+import os
+
+# 克隆仓库
+if not os.path.exists("MOSS-TTS-Nano"):
+    !git clone https://github.com/OpenMOSS/MOSS-TTS-Nano.git
+else:
+    print("Repository already exists, skipping clone.")
+
+os.chdir("MOSS-TTS-Nano")
+
+# 安装 pynini (conda-forge 版本最稳定，Colab 中也可用 pip 但需指定版本)
+# 这里使用 pip 安装兼容版本，若失败请尝试 conda
+!pip install pynini==2.1.6.post1
+
+# 安装 WeTextProcessing (从源码安装以避免 wheel 兼容性问题)
+!pip install git+https://github.com/WhizZest/WeTextProcessing.git
+
+# 安装项目其余依赖
+# 注意：requirements.txt 中可能包含 WeTextProcessing，为避免重复或冲突，
+# 我们建议先移除它再安装，或者忽略错误。这里直接安装，若报错可忽略 WeTextProcessing 相关行。
+!sed -i '/WeTextProcessing/d' requirements.txt
+!pip install -r requirements.txt
+
+# 以 editable 模式安装 moss-tts-nano，使 CLI 命令可用
+!pip install -e .
+
+print("\n✅ 环境安装完成！")
+
+# @title 🔧 修复 Torch/Torchvision 兼容性并重新推理
+import os
+import subprocess
+
+# 1. 修复 torchvision 与 torch 的版本冲突
+# Colab 默认的 torchvision 往往滞后于 torch，导致 _meta_registrations 报错
+print("🔧 正在对齐 torch 和 torchvision 版本...")
+!pip install -U torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -q
+
+# 2. 确保 transformers 不会因缓存问题继续报错
+# 清除可能损坏的动态模块缓存
+!rm -rf /root/.cache/huggingface/modules/transformers_modules/OpenMOSS*
+
+os.chdir("/content/MOSS-TTS-Nano")
+# @title 3. ONNX CPU 加速推理
+# 首次运行会自动下载 ONNX 格式模型到 ./models/
+
+!python infer_onnx.py \
+  --prompt-audio-path assets/audio/zh_6.wav \
+  --text "欢迎关注模思智能、上海创智学院与复旦大学自然语言处理实验室。"
+
+print("\n🔊 ONNX 生成完毕！音频保存在: generated_audio/infer_output.wav")
+display(Audio("generated_audio/infer_onnx_output.wav"))

@@ -1,0 +1,326 @@
+name: YouTube 视频翻译配音搬运
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube 视频 URL'
+        required: true
+        type: string
+      max_speakers:
+        description: '最大说话人数量（留空自动检测）'
+        required: false
+        default: ''
+        type: string
+      translate_model:
+        description: '翻译用 LLM 模型名（留空用 AI_MODEL secret）'
+        required: false
+        default: ''
+        type: string
+
+# 防止并发运行冲突
+concurrency:
+  group: dub-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.10'
+  AI_API_URL: ${{ secrets.AI_API_URL }}
+  AI_API_KEY: ${{ secrets.AI_API_KEY }}
+  AI_MODEL: ${{ secrets.AI_MODEL }}
+
+jobs:
+  # ============================================================
+  # Job 1: WhisperX ASR + 说话人分离 + 参考音截取
+  # ============================================================
+  asr:
+    name: ASR + 说话人分离
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 安装 Deno（YouTube JS 解密）
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: 安装 yt-dlp
+        run: pip install -U yt-dlp
+
+      - name: 写入 YouTube cookies
+        if: ${{ secrets.YT_COOKIES != '' }}
+        run: |
+          printf '%s' "${{ secrets.YT_COOKIES }}" > youtube_cookies.txt
+          echo "cookies 文件已写入"
+
+      - name: 设置 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-asr-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/asr.txt', 'requirements/common.txt') }}
+
+      - name: 缓存 HuggingFace 模型
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-asr-${{ runner.os }}
+
+      - name: 安装 ASR 依赖
+        run: |
+          pip install -r requirements/common.txt
+          pip install -r requirements/asr.txt
+
+      - name: 下载音频
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          mkdir -p work
+          COOKIE_ARG=""
+          if [ -f youtube_cookies.txt ]; then COOKIE_ARG="--cookies youtube_cookies.txt"; fi
+          yt-dlp \
+            -x --audio-format wav --audio-quality 0 \
+            --extractor-args 'youtube:player_client=default,-web_safari' \
+            --remote-components 'ejs:github' \
+            --no-playlist \
+            $COOKIE_ARG \
+            -o 'work/original_audio.%(ext)s' \
+            "$VIDEO_URL"
+          ls -lh work/
+
+      - name: 运行 ASR + 说话人分离 + 参考音截取
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          VIDEO_URL: ${{ inputs.video_url }}
+          MAX_SPEAKERS: ${{ inputs.max_speakers }}
+        run: |
+          ARGS="--url \"$VIDEO_URL\" --output_dir work --audio_path work/original_audio.wav"
+          if [ -f youtube_cookies.txt ]; then ARGS="$ARGS --cookies youtube_cookies.txt"; fi
+          if [ -n "$MAX_SPEAKERS" ]; then ARGS="$ARGS --max_speakers $MAX_SPEAKERS"; fi
+          eval python src/asr_diarize.py $ARGS
+
+      - name: 上传 ASR 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: asr-output
+          path: work/
+          retention-days: 3
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asr-failure-logs
+          path: |
+            work/
+            *.log
+
+  # ============================================================
+  # Job 2: LLM 字幕翻译
+  # ============================================================
+  translate:
+    name: 字幕翻译
+    runs-on: ubuntu-latest
+    needs: asr
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-translate-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/common.txt') }}
+
+      - name: 安装依赖
+        run: pip install -r requirements/common.txt
+
+      - name: 下载 ASR 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: asr-output
+          path: work/
+
+      - name: 翻译字幕
+        env:
+          TRANSLATE_MODEL: ${{ inputs.translate_model }}
+        run: |
+          MODEL="$TRANSLATE_MODEL"
+          if [ -z "$MODEL" ]; then MODEL="${AI_MODEL}"; fi
+          python src/translate_subtitles.py \
+            --input work/word_level.txt \
+            --output work/word_level_translated.txt \
+            --api_url "${AI_API_URL}" \
+            --api_key "${AI_API_KEY}" \
+            --model "$MODEL" \
+            --max_workers 5
+
+      - name: 上传翻译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: translate-output
+          path: work/word_level_translated.txt
+          retention-days: 3
+
+  # ============================================================
+  # Job 3: moss-tts 语音克隆配音
+  # ============================================================
+  tts:
+    name: 语音克隆配音
+    runs-on: ubuntu-latest
+    needs: [asr, translate]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 设置 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 设置 conda（pynini 依赖）
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          auto-activate-base: true
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-tts-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/tts.txt', 'requirements/common.txt') }}
+
+      - name: 缓存 MOSS-TTS-Nano 仓库
+        id: cache-moss
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano
+          key: moss-tts-repo-v1
+
+      - name: 缓存 moss-tts ONNX 模型
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano/models
+          key: moss-tts-onnx-models-v1
+
+      - name: 安装 TTS 依赖
+        run: |
+          pip install -r requirements/common.txt
+          pip install -r requirements/tts.txt
+
+      - name: 安装 MOSS-TTS-Nano
+        run: bash scripts/install_moss_tts.sh MOSS-TTS-Nano
+        shell: bash
+
+      - name: 下载 ASR 产物（参考音）
+        uses: actions/download-artifact@v4
+        with:
+          name: asr-output
+          path: work/
+
+      - name: 下载翻译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: translate-output
+          path: work/
+
+      - name: 语音克隆配音
+        run: |
+          python src/tts_clone.py \
+            --input work/word_level_translated.txt \
+            --output work/dubbed_audio.mp3 \
+            --ref_map work/speaker_ref_map.json \
+            --moss_tts_dir MOSS-TTS-Nano \
+            --work_dir work_tts
+
+      - name: 上传配音产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-output
+          path: work/dubbed_audio.mp3
+          retention-days: 3
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-failure-logs
+          path: |
+            work/
+            work_tts/
+            *.log
+
+  # ============================================================
+  # Job 4: 视频合成 + B站上传
+  # ============================================================
+  upload:
+    name: 视频合成与上传
+    runs-on: ubuntu-latest
+    needs: tts
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 安装 Deno（YouTube JS 解密）
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: 设置 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-upload-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/common.txt') }}
+
+      - name: 安装依赖
+        run: pip install -r requirements/common.txt
+
+      - name: 写入 YouTube cookies
+        if: ${{ secrets.YT_COOKIES != '' }}
+        run: printf '%s' "${{ secrets.YT_COOKIES }}" > youtube_cookies.txt
+
+      - name: 下载配音产物
+        uses: actions/download-artifact@v4
+        with:
+          name: tts-output
+          path: work/
+
+      - name: 视频合成与上传
+        env:
+          BILIBILI_SESSDATA: ${{ secrets.BILIBILI_SESSDATA }}
+          BILIBILI_JCT: ${{ secrets.BILIBILI_JCT }}
+          BILIBILI_BUVID3: ${{ secrets.BILIBILI_BUVID3 }}
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          COOKIE_ARG=""
+          if [ -f youtube_cookies.txt ]; then COOKIE_ARG="--cookies youtube_cookies.txt"; fi
+          python src/upload_bilibili.py \
+            --url "$VIDEO_URL" \
+            --audio_path work/dubbed_audio.mp3 \
+            --api_config config/api_config.json \
+            --work_dir work_upload \
+            $COOKIE_ARG

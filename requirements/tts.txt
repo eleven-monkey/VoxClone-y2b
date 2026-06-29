@@ -1,0 +1,6 @@
+torch
+torchaudio
+numpy<2.1
+pydub
+soundfile
+onnxruntime
