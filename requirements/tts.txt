@@ -1,7 +1,2 @@
-torch
-torchaudio
-torchcodec
-numpy>=2.1
 pydub
-soundfile
-onnxruntime
+torchcodec

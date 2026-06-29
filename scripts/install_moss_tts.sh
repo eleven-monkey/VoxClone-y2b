@@ -28,9 +28,13 @@ echo "=== [4/6] 安装 WeTextProcessing (源码) ==="
 $CONDA_PIP install git+https://github.com/WhizZest/WeTextProcessing.git || \
   echo "警告: WeTextProcessing 安装失败，moss-tts 将使用内置文本规范化"
 
-echo "=== [5/6] 安装 requirements.txt ==="
+echo "=== [5/6] 安装 requirements.txt (moss-tts 自身依赖) ==="
 sed -i '/WeTextProcessing/d' requirements.txt || true
 $CONDA_PIP install -r requirements.txt
+
+# torchaudio 2.7+ 需要 torchcodec 但 requirements.txt 没声明
+echo "=== 补充 torchcodec (torchaudio 需要) ==="
+$CONDA_PIP install torchcodec
 
 echo "=== [6/6] editable 安装 moss-tts-nano ==="
 $CONDA_PIP install -e .
