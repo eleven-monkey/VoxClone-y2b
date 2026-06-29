@@ -1,9 +1,0 @@
-参考actionsautopython文件夹中的内容，开发一个项目，类似的目的，利用github的action翻译配音youtube视频然后上传B站，但是这次用本地tts模型moss-tts实现语音克隆配音，专门针对多人谈话类节目。
-
-# 参考内容
-- actionsautopython文件夹
-- moss-tts代码参考.txt
-- WshiperX说话人识别asr.py
-
-# 需求
-与actionsautopython类似，在github的action上简单设置，然后启动工作流自动完成，创新点是自动根据字幕分割参考音频，用tts的语音克隆功能进行配音。
