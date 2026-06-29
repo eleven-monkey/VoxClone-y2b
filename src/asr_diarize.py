@@ -105,9 +105,9 @@ def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None):
     # 5. 说话人分离
     print("初始化 Pyannote 说话人分离流水线...")
     try:
-        diarize_pipeline = DiarizationPipeline(token=hf_token, device=device)
+        diarize_pipeline = DiarizationPipeline(access_token=hf_token, device=device)
     except TypeError:
-        diarize_pipeline = DiarizationPipeline(use_auth_token=hf_token, device=device)
+        diarize_pipeline = DiarizationPipeline(access_token=hf_token, device=device)
 
     print("说话人分离中（CPU，较慢）...")
     diarize_kwargs = {}
