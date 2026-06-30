@@ -302,6 +302,9 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements/common.txt
 
+      - name: 升级 yt-dlp
+        run: pip install -U yt-dlp
+
       - name: 写入 YouTube cookies
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}

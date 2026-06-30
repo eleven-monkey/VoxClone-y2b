@@ -284,15 +284,17 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.work_dir, exist_ok=True)
-    # chdir 之前把音频路径转绝对路径，否则 chdir 后相对路径失效
+    # chdir 之前把音频/cookies/api_config 转绝对路径，否则 chdir 后相对路径失效
     audio_path_abs = os.path.abspath(args.audio_path)
     if not os.path.exists(audio_path_abs):
         print(f"错误: 找不到配音音频 {audio_path_abs}")
         return 1
+    cookies_path_abs = os.path.abspath(args.cookies) if args.cookies and os.path.exists(args.cookies) else None
+    api_config_path_abs = os.path.abspath(args.api_config) if args.api_config else None
     os.chdir(args.work_dir)
 
-    api_config = load_api_config(args.api_config)
-    cookies_file = args.cookies if (args.cookies and os.path.exists(args.cookies)) else None
+    api_config = load_api_config(api_config_path_abs)
+    cookies_file = cookies_path_abs
 
     # 1. 生成上传配置（翻译标题 + 标签）
     upload_config = generate_upload_config(args.url, api_config, cookies_file)
