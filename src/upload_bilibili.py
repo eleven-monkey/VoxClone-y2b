@@ -163,6 +163,8 @@ def get_video_title(url, cookies_file=None):
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
         if result.returncode == 0:
             return json.loads(result.stdout).get("title")
+        else:
+            print(f"yt-dlp 获取标题失败 (exit={result.returncode}): {result.stderr[:300]}")
     except Exception as e:
         print(f"获取标题出错: {e}")
     return None
@@ -289,7 +291,12 @@ def main():
     if not os.path.exists(audio_path_abs):
         print(f"错误: 找不到配音音频 {audio_path_abs}")
         return 1
-    cookies_path_abs = os.path.abspath(args.cookies) if args.cookies and os.path.exists(args.cookies) else None
+    cookies_path_abs = None
+    if args.cookies:
+        if os.path.exists(args.cookies):
+            cookies_path_abs = os.path.abspath(args.cookies)
+        else:
+            print(f"警告: 指定的 cookies 文件不存在: {args.cookies}，跳过 cookies")
     api_config_path_abs = os.path.abspath(args.api_config) if args.api_config else None
     os.chdir(args.work_dir)
 
@@ -321,14 +328,16 @@ def main():
         return 1
 
     # 4. 下载并压缩封面
-    download_thumbnail(args.url, "cover.%(ext)s", cookies_file)
-    covers = glob.glob("cover.*")
-    cover_jpeg = "cover.jpeg"
-    if covers:
-        if not convert_and_compress_to_jpeg(covers[0], cover_jpeg):
-            cover_jpeg = None
+    cover_jpeg = None
+    if download_thumbnail(args.url, "cover.%(ext)s", cookies_file):
+        covers = glob.glob("cover.*")
+        if covers:
+            cover_jpeg = "cover.jpeg"
+            if not convert_and_compress_to_jpeg(covers[0], cover_jpeg):
+                print("封面压缩失败，上传不带封面")
+                cover_jpeg = None
     else:
-        cover_jpeg = None
+        print("封面下载失败，上传不带封面")
 
     # 5. 上传 B站
     sessdata = os.environ.get("BILIBILI_SESSDATA", "")
