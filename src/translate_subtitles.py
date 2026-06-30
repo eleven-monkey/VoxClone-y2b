@@ -87,15 +87,23 @@ def contains_chinese(text):
 
 
 def is_valid_translation_format(text):
-    """校验翻译结果格式：每行符合 (HH:MM:SS.mmm) [Speaker XX] 中文。"""
+    """校验翻译结果格式：每行符合 (HH:MM:SS.mmm) [Speaker XX] 中文，且时间戳递增。"""
     if not text or not text.strip():
         return False, "文本为空"
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return False, "没有有效行"
+    prev_ts = None
     for i, line in enumerate(lines, 1):
         if not LINE_PATTERN.match(line):
             return False, f"第{i}行格式不正确: {line[:80]}"
+        # 提取时间戳，检查严格递增
+        ts_match = re.search(r'\((\d{2}:\d{2}:\d{2}\.\d{3})\)', line)
+        if ts_match:
+            ts = ts_match.group(1)
+            if prev_ts is not None and ts <= prev_ts:
+                return False, f"第{i}行时间戳未递增: {ts} <= {prev_ts}"
+            prev_ts = ts
     return True, "格式正确"
 
 
