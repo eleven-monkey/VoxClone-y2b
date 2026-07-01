@@ -13,9 +13,7 @@ import sys
 import time
 import json
 import argparse
-import threading
 from random import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -47,7 +45,7 @@ SYSTEM_PROMPT = """# Role: 专业字幕翻译官
 (00:01:30.123) [Speaker 01] 谢谢你们的邀请。
 """
 
-progress_lock = threading.Lock()
+
 completed_count = 0
 total_count = 0
 
@@ -179,14 +177,13 @@ def translate_segment(segment_text, api_config, max_retries=5):
 
 
 def translate_worker(task, api_config):
-    """线程池工作函数。"""
+    """串行翻译工作函数。"""
     global completed_count, total_count
     idx, text = task
     result = translate_segment(text, api_config)
-    with progress_lock:
-        completed_count += 1
-        status = "成功" if result else "失败"
-        print(f"[进度 {completed_count}/{total_count}] 段落 {idx + 1} {status}")
+    completed_count += 1
+    status = "成功" if result else "失败"
+    print(f"[进度 {completed_count}/{total_count}] 段落 {idx + 1} {status}")
     return idx, result
 
 
@@ -215,21 +212,19 @@ def main():
     print(f"读取 {len(lines)} 行字幕")
 
     segments = segment_lines(lines, segment_size=args.segment_size)
-    print(f"分为 {len(segments)} 段，使用 {args.max_workers} 线程并行翻译")
+    print(f"分为 {len(segments)} 段，串行顺序翻译")
 
     global completed_count, total_count
     completed_count = 0
     total_count = len(segments)
 
     results = {}
-    tasks = [(i, seg) for i, seg in enumerate(segments)]
     start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        futures = {executor.submit(translate_worker, t, api_config): t[0] for t in tasks}
-        for future in as_completed(futures):
-            idx, translated = future.result()
-            results[idx] = translated
+    # 串行顺序翻译（不并发请求 API）
+    for i, seg in enumerate(segments):
+        idx, result = translate_worker((i, seg), api_config)
+        results[idx] = result
 
     elapsed = time.time() - start_time
 
