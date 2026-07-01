@@ -229,7 +229,7 @@ jobs:
 
       - name: 安装 MOSS-TTS-Nano
         run: bash scripts/install_moss_tts.sh MOSS-TTS-Nano
-        shell: bash
+        shell: bash -el {0}
 
       - name: 下载 ASR 产物（参考音）
         uses: actions/download-artifact@v4

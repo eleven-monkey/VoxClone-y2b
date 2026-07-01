@@ -3,6 +3,20 @@
 # 参考 moss_tts_demo.py 的安装顺序，适配 GitHub Actions
 set -e
 
+# 在 GitHub Actions 的非 login shell 里显式加载 conda shell 函数，
+# 避免直接调用 /home/runner/miniconda3/condabin/conda 时被系统 Python 执行而报 No module named 'conda'。
+if ! command -v conda &>/dev/null; then
+  echo "错误：当前 shell 未找到 conda 命令，请检查 setup-miniconda 是否正确安装"
+  exit 1
+fi
+# 兼容 conda>=4.6 的 shell 初始化方式（Miniforge 自带）
+if command -v conda &>/dev/null && [ -z "${_CONDA_EXE+x}" ]; then
+  eval "$(conda shell.bash hook)" || {
+    echo "错误：conda shell.bash hook 初始化失败"
+    exit 1
+  }
+fi
+
 INSTALL_DIR="${1:-MOSS-TTS-Nano}"
 
 echo "=== [1/7] git clone MOSS-TTS-Nano ==="
