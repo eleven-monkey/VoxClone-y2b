@@ -316,8 +316,8 @@ def main():
 
         trans_lines = [l.strip() for l in translated.splitlines() if l.strip()]
 
-        # 校对行数：译文比原文少 1 行视为正常（模型合并了相邻句），缺行不兜底
-        if len(trans_lines) >= len(original_lines) - 1:
+        # 校对行数：译文行数 ∈ [原文-1, 原文] 视为正常（最多允许模型合并一句），缺行不兜底
+        if len(trans_lines) <= len(original_lines) and len(trans_lines) >= len(original_lines) - 1:
             if len(trans_lines) < len(original_lines):
                 # 译文少 1 行：模型合并翻译，缺行不补
                 print(f"  [译文合并] 段落 {i + 1}：译文{len(trans_lines)}行/原{len(original_lines)}行（合并翻译，跳过缺行）")
@@ -331,7 +331,7 @@ def main():
                     print(f"  [翻译回退] 段落 {i + 1} 行: {ol[:60]}")
                     translated_lines.append(ol)
         else:
-            # 行数偏差过大（少 ≥2 行）：整段用原文兜底
+            # 行数偏差（译文多行 / 少 ≥2 行）：整段用原文兜底
             print(f"  [翻译回退整段] 段落 {i + 1}（译{len(trans_lines)}行/原{len(original_lines)}行）")
             total_fallback_lines += len(original_lines)
             for line in original_lines:
