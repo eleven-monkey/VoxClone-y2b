@@ -316,10 +316,10 @@ def main():
 
         trans_lines = [l.strip() for l in translated.splitlines() if l.strip()]
 
-        # 校对行数是否一致
-        if len(trans_lines) == len(original_lines):
+        # 校对行数：译文比原文少 1 行视为正常（模型合并了相邻句），缺行用原文兜底
+        if len(trans_lines) >= len(original_lines) - 1 and len(trans_lines) <= len(original_lines):
             # 逐行校验：单行失败用对应原文兜底
-            for tl, ol in zip(trans_lines, original_lines):
+            for j, (tl, ol) in enumerate(zip(trans_lines, original_lines)):
                 ok, _ = is_valid_translation_format(tl)
                 if ok and contains_chinese(_extract_text_after_speaker(tl)):
                     translated_lines.append(tl)
@@ -328,8 +328,14 @@ def main():
                     total_fallback_lines += 1
                     print(f"  [翻译回退] 段落 {i + 1} 行: {ol[:60]}")
                     translated_lines.append(ol)
+            # 译文少 1 行：补一行原文（保留时间戳对齐 + 内容有意义，避免 TTS 重复）
+            if len(trans_lines) < len(original_lines):
+                missing_count = len(original_lines) - len(trans_lines)
+                print(f"  [译文合并] 段落 {i + 1}：译文少 {missing_count} 行（合并翻译），缺行用原文填充")
+                for ol in original_lines[len(trans_lines):]:
+                    translated_lines.append(ol)
         else:
-            # 行数不一致：整段用原文兜底（保守策略，确保对齐）
+            # 行数偏差过大（≥2 行或译文多出）：整段用原文兜底
             print(f"  [翻译回退整段] 段落 {i + 1}（译{len(trans_lines)}行/原{len(original_lines)}行）")
             total_fallback_lines += len(original_lines)
             for line in original_lines:
