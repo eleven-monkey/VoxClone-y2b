@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LLM 并行字幕翻译（兼容 OpenAI / SiliconFlow 接口）。
+"""LLM 串行字幕翻译（兼容 OpenAI / SiliconFlow 接口）。
 
 输入格式: (HH:MM:SS.mmm) [Speaker 00] 原文
 输出格式: (HH:MM:SS.mmm) [Speaker 00] 中文译文
 翻译时严格保留时间戳和说话人标签。
+
+API 失败（如 500 Server Error）时，用本地 llama-cpp-python 加载
+tencent/Hy-MT2-1.8B-GGUF 兜底翻译，避免回退原文影响配音效果。
 """
 
 import os
@@ -44,6 +47,10 @@ SYSTEM_PROMPT = """# Role: 专业字幕翻译官
 (00:01:23.456) [Speaker 00] 大家好，欢迎来到节目。
 (00:01:30.123) [Speaker 01] 谢谢你们的邀请。
 """
+
+# 本地兜底模型配置（API 失败时启用）
+FALLBACK_MODEL_REPO = "tencent/Hy-MT2-1.8B-GGUF"
+FALLBACK_MODEL_FILE = "Hy-MT2-1.8B-Q4_K_M.gguf"
 
 
 completed_count = 0
@@ -137,9 +144,78 @@ def clean_content(content):
     return content
 
 
+# ----------------------------------------------------------------------
+# 本地 llama-cpp-python 兜底翻译
+# ----------------------------------------------------------------------
+_local_llm = None
+
+
+def get_local_llm():
+    """懒加载本地 llama-cpp-python 模型，仅在 API 失败时才加载。"""
+    global _local_llm
+    if _local_llm is not None:
+        return _local_llm
+    try:
+        from llama_cpp import Llama
+    except ImportError:
+        print("  [兜底] llama-cpp-python 未安装，无法本地兜底")
+        return None
+
+    # 优先使用 HF_HOME / HF_HUB_CACHE 等环境变量定位缓存
+    cache_dir = os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE") or None
+    print(f"  [兜底] 加载本地模型 {FALLBACK_MODEL_REPO}/{FALLBACK_MODEL_FILE} ...")
+    try:
+        _local_llm = Llama.from_pretrained(
+            repo_id=FALLBACK_MODEL_REPO,
+            filename=FALLBACK_MODEL_FILE,
+            cache_dir=cache_dir,
+            n_ctx=4096,
+            n_threads=4,
+            verbose=False,
+        )
+        print("  [兜底] 本地模型加载完成")
+    except Exception as e:
+        print(f"  [兜底] 本地模型加载失败: {e}")
+        _local_llm = None
+    return _local_llm
+
+
+def translate_segment_local(segment_text):
+    """用本地 llama 模型翻译一个段落，返回译文或 None。"""
+    llm = get_local_llm()
+    if llm is None:
+        return None
+    try:
+        resp = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": segment_text},
+            ],
+            max_tokens=4000,
+            temperature=0.3,
+            top_p=0.7,
+        )
+        translated = resp["choices"][0]["message"]["content"]
+        translated = filter_think_tags(translated or "")
+        if not translated or not contains_chinese(translated):
+            print("  [兜底] 本地翻译未含中文")
+            return None
+        ok, err = is_valid_translation_format(translated)
+        if not ok:
+            print(f"  [兜底] 格式校验失败: {err}")
+            return None
+        return translated
+    except Exception as e:
+        print(f"  [兜底] 本地翻译异常: {e}")
+        return None
+
+
 def translate_segment(segment_text, api_config, max_retries=5):
-    """翻译一个段落，返回 (译文, normalized_flag) 或 (None, False)。
-    失败时回退：5次重试 → 纠错 + 1次再重试 → 返回最后一次的纠错后文本（让调用方逐行兜底）。
+    """翻译一个段落，返回 (译文, normalized_flag, server_error)。
+
+    - 成功：(译文, False/True, False)
+    - API 服务端错误（5xx）：提前结束重试，返回 (None, False, True) 让调用方走本地兜底
+    - 其他失败（网络/格式）：5次重试 → 纠错 + 1次再重试 → 返回最后一次文本（让调用方逐行兜底）
     """
     global completed_count
     url = api_config["url"]
@@ -168,6 +244,10 @@ def translate_segment(segment_text, api_config, max_retries=5):
                 delay = 1 * (2 ** (attempt - 1)) + random() * 0.5
                 time.sleep(delay)
             response = requests.post(url, json=data, headers=headers, timeout=60)
+            # 5xx 服务端错误：API 本身挂了，重试也是同样的结果，直接跳出走兜底
+            if 500 <= response.status_code < 600:
+                print(f"  服务端错误 {response.status_code} (尝试 {attempt + 1}/{max_retries})，将尝试本地兜底")
+                return None, False, True
             response.raise_for_status()
             result = response.json()
 
@@ -189,9 +269,13 @@ def translate_segment(segment_text, api_config, max_retries=5):
                 print(f"  格式校验失败 (尝试 {attempt + 1}/{max_retries}): {err}")
                 continue
 
-            return translated, False
+            return translated, False, False
 
         except requests.exceptions.RequestException as e:
+            status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+            if status is not None and 500 <= status < 600:
+                print(f"  请求错误 {status} (尝试 {attempt + 1}/{max_retries}): {e}，将尝试本地兜底")
+                return None, False, True
             print(f"  请求错误 (尝试 {attempt + 1}/{max_retries}): {e}")
             continue
         except Exception as e:
@@ -207,7 +291,7 @@ def translate_segment(segment_text, api_config, max_retries=5):
             ok, err = is_valid_translation_format(normalized)
             if ok:
                 print(f"  纠错后格式通过（无需再请求）")
-                return normalized, True
+                return normalized, True, False
             print(f"  纠错后仍不通过: {err}，再请求 1 次让模型自修")
         else:
             print(f"  5 次重试后仍未通过且无可纠错项，再请求 1 次")
@@ -216,6 +300,10 @@ def translate_segment(segment_text, api_config, max_retries=5):
     try:
         time.sleep(1)
         response = requests.post(url, json=data, headers=headers, timeout=60)
+        # 纠错阶段也遇到 5xx，直接走本地兜底
+        if 500 <= response.status_code < 600:
+            print(f"  纠错阶段服务端错误 {response.status_code}，将尝试本地兜底")
+            return None, False, True
         response.raise_for_status()
         result = response.json()
         translated = None
@@ -230,31 +318,48 @@ def translate_segment(segment_text, api_config, max_retries=5):
             ok, err = is_valid_translation_format(translated)
             if ok:
                 print(f"  纠错阶段成功（模型自修）")
-                return translated, True
+                return translated, True, False
             # 再纠错一次
             normalized = normalize_translation(translated)
             ok2, _ = is_valid_translation_format(normalized)
             if ok2:
                 print(f"  纠错阶段成功（正则修复+模型自修）")
-                return normalized, True
+                return normalized, True, False
             last_normalized = normalized
+    except requests.exceptions.RequestException as e:
+        status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+        if status is not None and 500 <= status < 600:
+            print(f"  纠错阶段请求错误 {status}，将尝试本地兜底")
+            return None, False, True
+        print(f"  纠错阶段请求出错: {e}")
     except Exception as e:
         print(f"  纠错阶段请求出错: {e}")
 
     # 全部失败：返回最后一次纠错后的文本（让 main() 逐行兜底）
     if last_normalized:
-        return last_normalized, True
-    return last_translated, True  # 可能为 None，但保持二元组契约
+        return last_normalized, True, False
+    return last_translated, True, False  # 可能为 None，但保持三元组契约
 
 
 def translate_worker(task, api_config):
-    """串行翻译工作函数。返回 (idx, translated, original_seg, normalized_flag)。"""
+    """串行翻译工作函数。返回 (idx, translated, original_seg, normalized_flag)。
+
+    API 服务端错误（5xx）或重试耗尽仍无结果时，用本地 llama 兜底翻译。
+    """
     global completed_count, total_count
     idx, text = task
-    translated, normalized = translate_segment(text, api_config)
+    translated, normalized, server_error = translate_segment(text, api_config)
+
+    # API 服务端错误或重试耗尽仍无译文 → 尝试本地 llama 兜底
+    if translated is None and server_error:
+        print(f"  段落 {idx + 1} API 服务端错误，尝试本地 llama 兜底...")
+        translated = translate_segment_local(text)
+        if translated is not None:
+            normalized = True  # 本地兜底结果视为已纠错
+
     completed_count += 1
     status = "成功" if translated else "失败"
-    flag = "（已纠错）" if normalized else ""
+    flag = "（已纠错/兜底）" if normalized else ""
     print(f"[进度 {completed_count}/{total_count}] 段落 {idx + 1} {status}{flag}")
     return idx, translated, text, normalized
 

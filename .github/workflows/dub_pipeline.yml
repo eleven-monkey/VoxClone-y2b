@@ -152,8 +152,19 @@ jobs:
           path: ~/.cache/pip
           key: pip-translate-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/common.txt') }}
 
+      - name: 缓存本地兜底模型（Hy-MT2-1.8B-GGUF）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hymt2-gguf-v1
+
       - name: 安装依赖
-        run: pip install -r requirements/common.txt
+        run: |
+          pip install -r requirements/common.txt
+          # 安装 llama-cpp-python CPU 预编译版，用于 API 失败时本地兜底翻译
+          pip install llama-cpp-python --no-cache-dir --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+          # huggingface_hub 用于 Llama.from_pretrained 下载 GGUF 模型
+          pip install "huggingface_hub>=0.20,<0.30"
 
       - name: 下载 ASR 产物
         uses: actions/download-artifact@v4
