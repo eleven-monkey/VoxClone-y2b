@@ -62,6 +62,153 @@ def format_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milli:03d}"
 
 
+def _resegment_with_pysbd(final_result, language="en"):
+    """用 PySBD 对 WhisperX segments 重新分句，词级时间戳回填。
+
+    WhisperX 的 segment 边界依赖 Whisper 自动生成的标点，对含点缩写
+    （Mr./U.S./p.m./L.I./Ph.D./No./St. 等）会误切成两段。本函数后处理：
+
+    1. 拍平所有 segments 的 words 为全局词列表 + 大文本，记录每个词
+       在大文本中的字符偏移
+    2. PySBD 对大文本重新切句
+    3. 按字符范围把词映射回各句
+    4. 每句 start=首词.start、end=末词.end、speaker=多数票
+    5. 替换 final_result["segments"]
+
+    若 PySBD 未安装、词级时间戳缺失、或 PySBD 输出长度与原文不符
+    （说明切句改写了字符），原样返回 final_result，保证流程不中断。
+
+    Args:
+        final_result: whisperx.assign_word_speakers 的返回值
+        language: 语言代码（en/zh/ja 等），用于 PySBD 选择规则集
+
+    Returns:
+        final_result（可能 segments 已重写）
+    """
+    try:
+        import pysbd
+    except ImportError:
+        print("pysbd 未安装，跳过重分句（pip install pysbd 可启用）")
+        return final_result
+
+    segments = final_result.get("segments", [])
+    if not segments:
+        return final_result
+
+    # 1. 拍平所有 words，构造大文本 + 字符偏移
+    global_words = []
+    text_parts = []
+    cursor = 0
+    for seg in segments:
+        words = seg.get("words")
+        if not words:
+            # 任意段缺词级时间戳，无法回填，跳过重分句
+            print("部分 segment 缺失词级时间戳，跳过重分句")
+            return final_result
+        for w in words:
+            wtext = w.get("word", "")
+            if not wtext:
+                continue
+            if text_parts:
+                text_parts.append(" ")
+                cursor += 1
+            cs = cursor
+            ce = cursor + len(wtext)
+            global_words.append({
+                "word": wtext,
+                "start": w.get("start"),
+                "end": w.get("end"),
+                "speaker": w.get("speaker"),
+                "char_start": cs,
+                "char_end": ce,
+            })
+            text_parts.append(wtext)
+            cursor = ce
+
+    if not global_words:
+        return final_result
+
+    full_text = "".join(text_parts)
+
+    # 2. PySBD 分句（clean=False 保留原文标点不清洗）
+    try:
+        segmenter = pysbd.Segmenter(language=language, clean=False)
+    except (ValueError, KeyError):
+        # 不支持的语言，回退 en
+        print(f"PySBD 不支持语言 {language}，回退 en")
+        segmenter = pysbd.Segmenter(language="en", clean=False)
+
+    sent_texts = segmenter.segment(full_text)
+
+    # 3. 累积定位每句字符范围，校验长度一致
+    #    PySBD 不增删字符，只切边界，累积长度应等于原文长度
+    sent_ranges = []
+    pos = 0
+    for st in sent_texts:
+        sent_ranges.append((pos, pos + len(st)))
+        pos += len(st)
+    if pos != len(full_text):
+        print(f"PySBD 输出长度 {pos} 与原文 {len(full_text)} 不符，跳过重分句")
+        return final_result
+
+    # 4. 字符范围 → 词列表 → 时间戳与说话人
+    new_segments = []
+    word_idx = 0
+    n_words = len(global_words)
+    for s, e in sent_ranges:
+        # 双指针：词与句都按文本顺序排列，推进直到词起点 >= 句末
+        sent_words = []
+        while word_idx < n_words and global_words[word_idx]["char_start"] < e:
+            w = global_words[word_idx]
+            if w["char_end"] > s:
+                sent_words.append(w)
+            word_idx += 1
+
+        if not sent_words:
+            continue
+
+        starts = [w["start"] for w in sent_words if w["start"] is not None]
+        ends = [w["end"] for w in sent_words if w["end"] is not None]
+        if not starts or not ends:
+            # 词级时间戳缺失，跳过此句
+            continue
+
+        # 说话人多数票
+        speakers = [w["speaker"] for w in sent_words if w.get("speaker")]
+        if speakers:
+            speaker = max(set(speakers), key=speakers.count)
+        else:
+            speaker = "SPEAKER_UNKNOWN"
+
+        sent_text = full_text[s:e].strip()
+        if not sent_text:
+            continue
+
+        new_segments.append({
+            "start": starts[0],
+            "end": ends[-1],
+            "text": sent_text,
+            "speaker": speaker,
+            "words": [
+                {
+                    "word": w["word"],
+                    "start": w["start"],
+                    "end": w["end"],
+                    "speaker": w.get("speaker"),
+                }
+                for w in sent_words
+            ],
+        })
+
+    if not new_segments:
+        print("PySBD 重分句未产出有效段，保留原 segments")
+        return final_result
+
+    print(f"PySBD 重分句: 原 {len(segments)} 段 → 新 {len(new_segments)} 段")
+    final_result["segments"] = new_segments
+    return final_result
+
+
 def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None, language=None):
     """执行 WhisperX 转写 + 说话人分离，返回 (word_level路径, diarize_segments, audio)。
 
@@ -145,6 +292,9 @@ def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None, languag
     # 6. 对齐说话人到词
     print("对齐说话人标签...")
     final_result = whisperx.assign_word_speakers(diarize_segments, result)
+
+    # 6.5 PySBD 重分句，修正 Mr./U.S./p.m./L.I. 等含点缩写导致的误切
+    final_result = _resegment_with_pysbd(final_result, language=detected_lang)
 
     # 7. 写出 word_level.txt
     os.makedirs(output_dir, exist_ok=True)
