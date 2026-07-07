@@ -21,6 +21,7 @@ WIDTH = 2            # 16-bit
 MAX_INT = 2 ** (8 * WIDTH - 1) - 1
 FADE_MS = 10         # 每段音频首尾淡入淡出时长
 TARGET_RMS = 0.1     # 响度归一化目标 RMS（相对 MAX_INT）
+INTER_SENTENCE_GAP_MS = 180  # 相邻配音段间保留的停顿，避免"赶场"感
 
 
 def parse_timestamp(timestamp):
@@ -197,7 +198,7 @@ def mix_segments(segments):
         if i < len(loaded) - 1:
             next_start = loaded[i + 1][0]
             if end_time > next_start + 100:
-                target = next_start - start_ms - 50
+                target = next_start - start_ms - INTER_SENTENCE_GAP_MS
                 # 修正：只要当前音频超过可用空间就尝试变速
                 if target > 0 and len(audio) > target:
                     factor = min(len(audio) / target, 2.0)

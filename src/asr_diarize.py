@@ -62,8 +62,12 @@ def format_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milli:03d}"
 
 
-def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None):
-    """执行 WhisperX 转写 + 说话人分离，返回 (word_level路径, diarize_segments, audio)。"""
+def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None, language=None):
+    """执行 WhisperX 转写 + 说话人分离，返回 (word_level路径, diarize_segments, audio)。
+
+    language: ISO 语言代码（如 en/zh/ja）。指定则跳过自动检测，避免误判
+              （WhisperX 自动检测常把英语误判为 cy 等小语种，导致无对齐模型）。
+    """
     import torch
     import whisperx
     from whisperx.diarize import DiarizationPipeline
@@ -83,18 +87,38 @@ def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None):
 
     # 3. 转写
     print("ASR 转写中（CPU，请耐心等待）...")
-    result = model.transcribe(audio, batch_size=1)
-    print(f"转写完成，检测语言: {result['language']}")
+    transcribe_kwargs = {"batch_size": 1}
+    if language:
+        transcribe_kwargs["language"] = language
+        print(f"使用指定语言: {language}（跳过自动检测）")
+    result = model.transcribe(audio, **transcribe_kwargs)
+    detected_lang = result["language"]
+    print(f"转写完成，语言: {detected_lang}")
 
     # 释放转写模型内存
     del model
     gc.collect()
 
     # 4. 音素对齐
-    print("加载对齐模型，提取词级时间戳...")
-    model_a, metadata = whisperx.load_align_model(
-        language_code=result["language"], device=device
-    )
+    # 兜底：WhisperX 自带的自动检测偶尔会把英语误判成 cy（威尔士语）等
+    # 小语种，而这些语种没有对齐模型，会直接抛 ValueError 中断流程。
+    # 若检测出的语言没有对齐模型，回退到 en 并警告（用户可用 --language 修正）。
+    print(f"加载对齐模型（语言: {detected_lang}）...")
+    try:
+        model_a, metadata = whisperx.load_align_model(
+            language_code=detected_lang, device=device
+        )
+    except ValueError as e:
+        print(f"警告: 语言 {detected_lang} 无对齐模型: {e}")
+        if language:
+            print(f"指定的语言 {language} 不被对齐模型支持，回退到 en。")
+        else:
+            print("自动检测的语言不被对齐模型支持，回退到 en。")
+            print("建议下次用 --language en（或其他支持的语言）显式指定以获得更好对齐质量。")
+        detected_lang = "en"
+        model_a, metadata = whisperx.load_align_model(
+            language_code=detected_lang, device=device
+        )
     result = whisperx.align(
         result["segments"], model_a, metadata, audio, device,
         return_char_alignments=False
@@ -260,6 +284,10 @@ def main():
     parser.add_argument("--hf_token", default=os.environ.get("HF_TOKEN", ""), help="HuggingFace token")
     parser.add_argument("--max_speakers", type=int, default=None, help="最大说话人数量")
     parser.add_argument("--audio_path", default=None, help="已有音频路径(跳过下载)")
+    parser.add_argument("--language", default="en",
+                        help="ASR 语言代码（默认 en）。绝大部分翻译源视频是英语，"
+                             "默认指定以避免 WhisperX 自动检测把英语误判成 cy 等小语种"
+                             "导致对齐失败。其他语言如 zh/ja 按需传入。")
     args = parser.parse_args()
 
     if not args.hf_token:
@@ -278,7 +306,8 @@ def main():
 
     # 2. ASR + 说话人分离
     word_level_path, diarize_segments, _ = run_asr_diarize(
-        audio_path, args.hf_token, args.output_dir, args.max_speakers
+        audio_path, args.hf_token, args.output_dir, args.max_speakers,
+        language=args.language
     )
 
     # 3. 截取说话人参考音
