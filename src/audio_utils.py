@@ -4,15 +4,14 @@
 从参考项目 tts.py 提取并适配：
 - parse_timestamp: 时间戳字符串转毫秒
 - split_text_by_timestamp: 解析带 [Speaker XX] 标签的字幕，返回 (timestamp, speaker, text)
-- adjust_audio_speed: ffmpeg atempo + lowpass 变速防重叠
-- fast_overlay: numpy 共享内存一次性混音
+- adjust_audio_speed: ffmpeg atempo 变速防重叠
+- fast_overlay: numpy 一次性混音
 """
 
 import os
 import re
 import subprocess
 import numpy as np
-from multiprocessing import shared_memory
 from pydub import AudioSegment
 
 # ---------- 混音参数 ---------- #
@@ -20,6 +19,8 @@ SR = 24_000          # 统一采样率
 N_CH = 1             # 单声道
 WIDTH = 2            # 16-bit
 MAX_INT = 2 ** (8 * WIDTH - 1) - 1
+FADE_MS = 10         # 每段音频首尾淡入淡出时长
+TARGET_RMS = 0.1     # 响度归一化目标 RMS（相对 MAX_INT）
 
 
 def parse_timestamp(timestamp):
@@ -84,16 +85,46 @@ def _to_int16_samples(audio: AudioSegment):
     return np.frombuffer(audio.raw_data, dtype=np.int16)
 
 
-def adjust_audio_speed(input_path, output_path, target_duration_ms, speed_factor):
-    """用 ffmpeg atempo + lowpass 调整音频速度，防止重叠时产生刺耳尖啸。
+def _apply_fades(samples, fade_ms=FADE_MS):
+    """在音频首尾施加线性淡入淡出，避免片段拼接 click/pop。"""
+    fade_samples = int(fade_ms * SR / 1000)
+    if fade_samples <= 0 or len(samples) <= 2 * fade_samples:
+        return samples
+    fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+    faded = samples.copy()
+    faded[:fade_samples] = (faded[:fade_samples] * fade_in).astype(faded.dtype)
+    faded[-fade_samples:] = (faded[-fade_samples:] * fade_in[::-1]).astype(faded.dtype)
+    return faded
+
+
+def _normalize_volume(samples, target_rms=TARGET_RMS):
+    """按 RMS 响度归一化到统一水平。"""
+    samples_float = samples.astype(np.float64)
+    rms = np.sqrt(np.mean(samples_float ** 2))
+    if rms <= 0:
+        return samples
+    scale = (target_rms * MAX_INT) / rms
+    # 限制最大增益，避免底噪被过度放大
+    scale = min(scale, 10.0)
+    scaled = np.clip(samples_float * scale, -MAX_INT - 1, MAX_INT)
+    return scaled.astype(np.int16)
+
+
+def adjust_audio_speed(input_path, output_path, speed_factor):
+    """用 ffmpeg atempo 调整音频速度，防止重叠时产生刺耳尖啸。
 
     返回 True 成功 / False 失败。
     """
     factor = max(0.5, min(speed_factor, 2.0))
     try:
+        # 高倍速时适度低通，低倍速时无需额外滤波
+        if factor > 1.5:
+            filter_chain = f'lowpass=f=12000,atempo={factor:.4f}'
+        else:
+            filter_chain = f'atempo={factor:.4f}'
         result = subprocess.run(
             ['ffmpeg', '-y', '-i', input_path,
-             '-filter:a', f'lowpass=f=8000,atempo={factor:.4f}',
+             '-filter:a', filter_chain,
              output_path],
             capture_output=True, text=True, timeout=120
         )
@@ -104,7 +135,7 @@ def adjust_audio_speed(input_path, output_path, target_duration_ms, speed_factor
 
 
 def fast_overlay(audio_entries):
-    """numpy 共享内存一次性混音。
+    """numpy 一次性混音。
 
     audio_entries: [(start_ms, AudioSegment), ...]  已按 start_ms 排序
     返回混音后的 AudioSegment
@@ -117,26 +148,25 @@ def fast_overlay(audio_entries):
     total_ms = last_start + len(last_audio) + 1000  # 留 1s 尾巴
     total_samples = int(total_ms * SR / 1000)
 
-    # 共享内存混音板
-    shm = shared_memory.SharedMemory(create=True, size=total_samples * N_CH * 4)
-    try:
-        buf = np.ndarray((total_samples * N_CH,), dtype=np.float32, buffer=shm.buf)
-        buf[:] = 0.0
+    # 普通 numpy 数组作为混音板（替代共享内存，简化单进程场景）
+    buf = np.zeros(total_samples * N_CH, dtype=np.float32)
 
-        for start_ms, audio in audio_entries:
-            samples = _to_int16_samples(audio).astype(np.float32)
-            start_sample = int(start_ms * SR / 1000)
-            end_sample = start_sample + len(samples)
-            if end_sample > total_samples:
-                end_sample = total_samples
-                samples = samples[:end_sample - start_sample]
-            buf[start_sample:end_sample] += samples
+    for start_ms, audio in audio_entries:
+        samples = _to_int16_samples(audio)
+        # 先归一化音量，再淡入淡出，最后叠加
+        samples = _normalize_volume(samples)
+        samples = _apply_fades(samples)
+        samples_float = samples.astype(np.float32)
+        start_sample = int(start_ms * SR / 1000)
+        end_sample = start_sample + len(samples_float)
+        if end_sample > total_samples:
+            end_sample = total_samples
+            samples_float = samples_float[:end_sample - start_sample]
+        buf[start_sample:end_sample] += samples_float
 
-        np.clip(buf, -MAX_INT, MAX_INT, out=buf)
-        out_bytes = buf.astype(np.int16).tobytes()
-    finally:
-        shm.close()
-        shm.unlink()
+    # 软限幅替代硬削波，听感更自然
+    buf = np.tanh(buf / MAX_INT) * MAX_INT
+    out_bytes = buf.astype(np.int16).tobytes()
 
     return AudioSegment(data=out_bytes, sample_width=WIDTH, frame_rate=SR, channels=N_CH)
 
@@ -168,7 +198,8 @@ def mix_segments(segments):
             next_start = loaded[i + 1][0]
             if end_time > next_start + 100:
                 target = next_start - start_ms - 50
-                if target > 100:
+                # 修正：只要当前音频超过可用空间就尝试变速
+                if target > 0 and len(audio) > target:
                     factor = min(len(audio) / target, 2.0)
                     tmp_out = path + '.speed.wav'
                     tmp_in = path
@@ -177,7 +208,7 @@ def mix_segments(segments):
                         tmp_in = path + '.in.wav'
                         audio.export(tmp_in, format='wav')
                         temp_files.append(tmp_in)
-                    if adjust_audio_speed(tmp_in, tmp_out, target, factor):
+                    if adjust_audio_speed(tmp_in, tmp_out, factor):
                         try:
                             audio = AudioSegment.from_file(tmp_out)
                             temp_files.append(tmp_out)
