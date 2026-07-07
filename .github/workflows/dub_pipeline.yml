@@ -194,18 +194,23 @@ jobs:
           retention-days: 3
 
   # ============================================================
-  # Job 3: moss-tts 语音克隆配音
+  # Job 3: moss-tts 语音克隆配音（首轮，带时间预算与断点续作）
   # ============================================================
   tts:
-    name: 语音克隆配音
+    name: 语音克隆配音（第1轮）
     runs-on: ubuntu-latest
     needs: [asr, translate]
-    timeout-minutes: 360
+    timeout-minutes: 350
+    outputs:
+      completed: ${{ steps.check-done.outputs.completed }}
     defaults:
       run:
         shell: bash -el {0}
     steps:
       - uses: actions/checkout@v4
+
+      - name: 记录开始时间
+        run: echo "JOB_START_TS=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: 安装 ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -257,15 +262,44 @@ jobs:
           path: work/
 
       - name: 语音克隆配音
+        id: tts-run
         run: |
-          python src/tts_clone.py \
-            --input work/word_level_translated.txt \
-            --output work/dubbed_audio.mp3 \
-            --ref_map work/speaker_ref_map.json \
-            --moss_tts_dir MOSS-TTS-Nano \
-            --work_dir work_tts
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - JOB_START_TS))
+          BUDGET=$((340*60 - ELAPSED - 300))   # 340分钟预算 - 已用 - 5分钟收尾
+          echo "已用 ${ELAPSED}s，TTS 循环预算 ${BUDGET}s"
+          if [ "$BUDGET" -lt 600 ]; then
+            echo "时间预算不足(${BUDGET}s)，直接标记续作"
+            mkdir -p work_tts && touch work_tts/NEED_RESUME
+          else
+            python src/tts_clone.py \
+              --input work/word_level_translated.txt \
+              --output work/dubbed_audio.mp3 \
+              --ref_map work/speaker_ref_map.json \
+              --moss_tts_dir MOSS-TTS-Nano \
+              --work_dir work_tts \
+              --time_budget_seconds "$BUDGET"
+          fi
 
-      - name: 上传配音产物
+      - name: 判断完成状态
+        id: check-done
+        run: |
+          if [ -f work_tts/NEED_RESUME ]; then
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 上传 TTS 进度（未完成时）
+        if: steps.check-done.outputs.completed == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-progress
+          path: work_tts/
+          retention-days: 3
+
+      - name: 上传配音产物（完成时）
+        if: steps.check-done.outputs.completed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: tts-output
@@ -283,12 +317,388 @@ jobs:
             *.log
 
   # ============================================================
+  # Job 3.1~3.3: TTS 续作（首轮超时后链式接力，最多 3 轮）
+  # ============================================================
+  tts-resume-1:
+    name: 语音克隆配音（续作1）
+    runs-on: ubuntu-latest
+    needs: tts
+    if: needs.tts.outputs.completed == 'false'
+    timeout-minutes: 350
+    outputs:
+      completed: ${{ steps.check-done.outputs.completed }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 记录开始时间
+        run: echo "JOB_START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 设置 conda（Python 3.10 + pynini 依赖）
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: '3.10'
+          miniforge-version: latest
+          auto-activate-base: true
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-tts-${{ runner.os }}-py3.10-sf-${{ hashFiles('requirements/tts.txt', 'requirements/common.txt') }}
+
+      - name: 缓存 MOSS-TTS-Nano 仓库
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano
+          key: moss-tts-repo-v1
+
+      - name: 缓存 moss-tts ONNX 模型
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano/models
+          key: moss-tts-onnx-models-v1
+
+      - name: 安装 TTS 依赖
+        run: |
+          pip install -r requirements/common.txt
+          pip install -r requirements/tts.txt
+
+      - name: 安装 MOSS-TTS-Nano
+        run: bash scripts/install_moss_tts.sh MOSS-TTS-Nano
+
+      - name: 下载 ASR 产物（参考音）
+        uses: actions/download-artifact@v4
+        with:
+          name: asr-output
+          path: work/
+
+      - name: 下载翻译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: translate-output
+          path: work/
+
+      - name: 下载上一轮 TTS 进度
+        uses: actions/download-artifact@v4
+        with:
+          name: tts-progress
+          path: work_tts/
+
+      - name: 语音克隆配音（续作）
+        id: tts-run
+        run: |
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - JOB_START_TS))
+          BUDGET=$((340*60 - ELAPSED - 300))
+          echo "已用 ${ELAPSED}s，TTS 循环预算 ${BUDGET}s"
+          python src/tts_clone.py \
+            --input work/word_level_translated.txt \
+            --output work/dubbed_audio.mp3 \
+            --ref_map work/speaker_ref_map.json \
+            --moss_tts_dir MOSS-TTS-Nano \
+            --work_dir work_tts \
+            --time_budget_seconds "$BUDGET" \
+            --resume
+
+      - name: 判断完成状态
+        id: check-done
+        run: |
+          if [ -f work_tts/NEED_RESUME ]; then
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 上传 TTS 进度（未完成时）
+        if: steps.check-done.outputs.completed == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-progress-1
+          path: work_tts/
+          retention-days: 3
+
+      - name: 上传配音产物（完成时）
+        if: steps.check-done.outputs.completed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-output
+          path: work/dubbed_audio.mp3
+          retention-days: 3
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-resume1-failure-logs
+          path: |
+            work/
+            work_tts/
+            *.log
+
+  tts-resume-2:
+    name: 语音克隆配音（续作2）
+    runs-on: ubuntu-latest
+    needs: tts-resume-1
+    if: needs.tts-resume-1.outputs.completed == 'false'
+    timeout-minutes: 350
+    outputs:
+      completed: ${{ steps.check-done.outputs.completed }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 记录开始时间
+        run: echo "JOB_START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 设置 conda（Python 3.10 + pynini 依赖）
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: '3.10'
+          miniforge-version: latest
+          auto-activate-base: true
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-tts-${{ runner.os }}-py3.10-sf-${{ hashFiles('requirements/tts.txt', 'requirements/common.txt') }}
+
+      - name: 缓存 MOSS-TTS-Nano 仓库
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano
+          key: moss-tts-repo-v1
+
+      - name: 缓存 moss-tts ONNX 模型
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano/models
+          key: moss-tts-onnx-models-v1
+
+      - name: 安装 TTS 依赖
+        run: |
+          pip install -r requirements/common.txt
+          pip install -r requirements/tts.txt
+
+      - name: 安装 MOSS-TTS-Nano
+        run: bash scripts/install_moss_tts.sh MOSS-TTS-Nano
+
+      - name: 下载 ASR 产物（参考音）
+        uses: actions/download-artifact@v4
+        with:
+          name: asr-output
+          path: work/
+
+      - name: 下载翻译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: translate-output
+          path: work/
+
+      - name: 下载上一轮 TTS 进度
+        uses: actions/download-artifact@v4
+        with:
+          name: tts-progress-1
+          path: work_tts/
+
+      - name: 语音克隆配音（续作）
+        id: tts-run
+        run: |
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - JOB_START_TS))
+          BUDGET=$((340*60 - ELAPSED - 300))
+          echo "已用 ${ELAPSED}s，TTS 循环预算 ${BUDGET}s"
+          python src/tts_clone.py \
+            --input work/word_level_translated.txt \
+            --output work/dubbed_audio.mp3 \
+            --ref_map work/speaker_ref_map.json \
+            --moss_tts_dir MOSS-TTS-Nano \
+            --work_dir work_tts \
+            --time_budget_seconds "$BUDGET" \
+            --resume
+
+      - name: 判断完成状态
+        id: check-done
+        run: |
+          if [ -f work_tts/NEED_RESUME ]; then
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 上传 TTS 进度（未完成时）
+        if: steps.check-done.outputs.completed == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-progress-2
+          path: work_tts/
+          retention-days: 3
+
+      - name: 上传配音产物（完成时）
+        if: steps.check-done.outputs.completed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-output
+          path: work/dubbed_audio.mp3
+          retention-days: 3
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-resume2-failure-logs
+          path: |
+            work/
+            work_tts/
+            *.log
+
+  tts-resume-3:
+    name: 语音克隆配音（续作3）
+    runs-on: ubuntu-latest
+    needs: tts-resume-2
+    if: needs.tts-resume-2.outputs.completed == 'false'
+    timeout-minutes: 350
+    outputs:
+      completed: ${{ steps.check-done.outputs.completed }}
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 记录开始时间
+        run: echo "JOB_START_TS=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 设置 conda（Python 3.10 + pynini 依赖）
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: '3.10'
+          miniforge-version: latest
+          auto-activate-base: true
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-tts-${{ runner.os }}-py3.10-sf-${{ hashFiles('requirements/tts.txt', 'requirements/common.txt') }}
+
+      - name: 缓存 MOSS-TTS-Nano 仓库
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano
+          key: moss-tts-repo-v1
+
+      - name: 缓存 moss-tts ONNX 模型
+        uses: actions/cache@v4
+        with:
+          path: MOSS-TTS-Nano/models
+          key: moss-tts-onnx-models-v1
+
+      - name: 安装 TTS 依赖
+        run: |
+          pip install -r requirements/common.txt
+          pip install -r requirements/tts.txt
+
+      - name: 安装 MOSS-TTS-Nano
+        run: bash scripts/install_moss_tts.sh MOSS-TTS-Nano
+
+      - name: 下载 ASR 产物（参考音）
+        uses: actions/download-artifact@v4
+        with:
+          name: asr-output
+          path: work/
+
+      - name: 下载翻译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: translate-output
+          path: work/
+
+      - name: 下载上一轮 TTS 进度
+        uses: actions/download-artifact@v4
+        with:
+          name: tts-progress-2
+          path: work_tts/
+
+      - name: 语音克隆配音（续作）
+        id: tts-run
+        run: |
+          NOW=$(date +%s)
+          ELAPSED=$((NOW - JOB_START_TS))
+          BUDGET=$((340*60 - ELAPSED - 300))
+          echo "已用 ${ELAPSED}s，TTS 循环预算 ${BUDGET}s"
+          python src/tts_clone.py \
+            --input work/word_level_translated.txt \
+            --output work/dubbed_audio.mp3 \
+            --ref_map work/speaker_ref_map.json \
+            --moss_tts_dir MOSS-TTS-Nano \
+            --work_dir work_tts \
+            --time_budget_seconds "$BUDGET" \
+            --resume
+
+      - name: 判断完成状态
+        id: check-done
+        run: |
+          if [ -f work_tts/NEED_RESUME ]; then
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 上传 TTS 进度（未完成时）
+        if: steps.check-done.outputs.completed == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-progress-3
+          path: work_tts/
+          retention-days: 3
+
+      - name: 上传配音产物（完成时）
+        if: steps.check-done.outputs.completed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-output
+          path: work/dubbed_audio.mp3
+          retention-days: 3
+
+      - name: 上传日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-resume3-failure-logs
+          path: |
+            work/
+            work_tts/
+            *.log
+
+  # ============================================================
   # Job 4: 视频合成 + B站上传
   # ============================================================
   upload:
     name: 视频合成与上传
     runs-on: ubuntu-latest
-    needs: tts
+    needs: [tts, tts-resume-1, tts-resume-2, tts-resume-3]
+    if: >-
+      always() && (
+        needs.tts.outputs.completed == 'true' ||
+        needs.tts-resume-1.outputs.completed == 'true' ||
+        needs.tts-resume-2.outputs.completed == 'true' ||
+        needs.tts-resume-3.outputs.completed == 'true'
+      )
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
