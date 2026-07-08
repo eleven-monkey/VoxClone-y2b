@@ -48,6 +48,31 @@ SYSTEM_PROMPT = """# Role: 专业字幕翻译官
 (00:01:30.123) [Speaker 01] 谢谢你们的邀请。
 """
 
+# 本地兜底模型专用提示词（不出现 HH:MM:SS.mmm 字面量，避免小模型照抄为通配符）
+FALLBACK_SYSTEM_PROMPT = """# Role: 专业字幕翻译官
+
+## 任务
+将外文字幕逐行翻译为中文，严格保留每行原有的时间戳和说话人标签。
+
+## 格式要求（极其重要）
+每行必须严格保持如下格式（时间戳为 `时:分:秒.毫秒`，三位整数加三位小数）：
+(00:00:00.000) [Speaker 00] 中文译文
+
+## 规则
+1. 时间戳必须原样保留：括号、小数点、数字位数均与原文一致，例如 (12:34:56.789) → (12:34:56.789)
+2. 说话人标签 [Speaker XX] 必须原样保留，不得翻译、修改编号或改变符号
+3. 只翻译冒号之后的正文内容为中文，时间戳与说话人标签一字不改
+4. 每行的时间戳和说话人标签与原文一一对应，不得合并、拆分或调换顺序
+5. 不要添加任何解释、注释、空行或多余的标点
+
+## 示例
+原文:
+(00:01:23.456) [Speaker 00] Hello everyone, welcome to the show.
+
+译文:
+(00:01:23.456) [Speaker 00] 大家好，欢迎来到节目。
+"""
+
 # 本地兜底模型配置（API 失败时启用）
 FALLBACK_MODEL_REPO = "tencent/Hy-MT2-1.8B-GGUF"
 FALLBACK_MODEL_FILE = "Hy-MT2-1.8B-Q4_K_M.gguf"
@@ -188,7 +213,7 @@ def translate_segment_local(segment_text):
     try:
         resp = llm.create_chat_completion(
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": FALLBACK_SYSTEM_PROMPT},
                 {"role": "user", "content": segment_text},
             ],
             max_tokens=4000,
@@ -214,8 +239,8 @@ def translate_segment(segment_text, api_config, max_retries=5):
     """翻译一个段落，返回 (译文, normalized_flag, server_error)。
 
     - 成功：(译文, False/True, False)
-    - API 服务端错误（5xx）：提前结束重试，返回 (None, False, True) 让调用方走本地兜底
-    - 其他失败（网络/格式）：5次重试 → 纠错 + 1次再重试 → 返回最后一次文本（让调用方逐行兜底）
+    - 全部重试 + 纠错都失败：返回最后一次文本（让调用方逐行兜底）
+    - API 服务端持续错误（5xx 贯穿 max_retries + 纠错阶段）：返回 (None, False, True) 让调用方走本地模型兜底
     """
     global completed_count
     url = api_config["url"]
@@ -237,6 +262,7 @@ def translate_segment(segment_text, api_config, max_retries=5):
 
     last_translated = None  # 记录最后一次原始返回，用于纠错阶段
     last_normalized = None  # 记录纠错后的文本
+    saw_server_error = False  # 记录是否遇到 5xx，全部失败后用于决定走兜底
 
     for attempt in range(max_retries):
         try:
@@ -244,10 +270,11 @@ def translate_segment(segment_text, api_config, max_retries=5):
                 delay = 1 * (2 ** (attempt - 1)) + random() * 0.5
                 time.sleep(delay)
             response = requests.post(url, json=data, headers=headers, timeout=60)
-            # 5xx 服务端错误：API 本身挂了，重试也是同样的结果，直接跳出走兜底
+            # 5xx 服务端错误：不立即返回，继续重试；累计到 max_retries 都失败后再走兜底
             if 500 <= response.status_code < 600:
-                print(f"  服务端错误 {response.status_code} (尝试 {attempt + 1}/{max_retries})，将尝试本地兜底")
-                return None, False, True
+                saw_server_error = True
+                print(f"  服务端错误 {response.status_code} (尝试 {attempt + 1}/{max_retries})，将继续重试")
+                continue
             response.raise_for_status()
             result = response.json()
 
@@ -274,8 +301,9 @@ def translate_segment(segment_text, api_config, max_retries=5):
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
             if status is not None and 500 <= status < 600:
-                print(f"  请求错误 {status} (尝试 {attempt + 1}/{max_retries}): {e}，将尝试本地兜底")
-                return None, False, True
+                saw_server_error = True
+                print(f"  请求错误 {status} (尝试 {attempt + 1}/{max_retries}): {e}，将继续重试")
+                continue
             print(f"  请求错误 (尝试 {attempt + 1}/{max_retries}): {e}")
             continue
         except Exception as e:
@@ -283,6 +311,11 @@ def translate_segment(segment_text, api_config, max_retries=5):
             continue
 
     # 5 次都失败：进入纠错阶段
+    # 如果主阶段每次都是 5xx（last_translated 为空），跳过纠错阶段直接走本地兜底
+    if saw_server_error and not last_translated:
+        print(f"  重试 {max_retries} 次均为服务端错误，跳过纠错阶段，直接走本地兜底")
+        return None, False, True
+
     # 先对最后一次返回纠错
     if last_translated:
         normalized = normalize_translation(last_translated)
@@ -300,40 +333,46 @@ def translate_segment(segment_text, api_config, max_retries=5):
     try:
         time.sleep(1)
         response = requests.post(url, json=data, headers=headers, timeout=60)
-        # 纠错阶段也遇到 5xx，直接走本地兜底
+        # 纠错阶段也遇到 5xx：记下来走本地兜底（前面主阶段已重试 max_retries 次）
         if 500 <= response.status_code < 600:
+            saw_server_error = True
             print(f"  纠错阶段服务端错误 {response.status_code}，将尝试本地兜底")
-            return None, False, True
-        response.raise_for_status()
-        result = response.json()
-        translated = None
-        try:
-            translated = result["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            pass
-        translated = filter_think_tags(translated or "")
-        last_translated = translated
+        else:
+            response.raise_for_status()
+            result = response.json()
+            translated = None
+            try:
+                translated = result["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                pass
+            translated = filter_think_tags(translated or "")
+            last_translated = translated
 
-        if translated and contains_chinese(translated):
-            ok, err = is_valid_translation_format(translated)
-            if ok:
-                print(f"  纠错阶段成功（模型自修）")
-                return translated, True, False
-            # 再纠错一次
-            normalized = normalize_translation(translated)
-            ok2, _ = is_valid_translation_format(normalized)
-            if ok2:
-                print(f"  纠错阶段成功（正则修复+模型自修）")
-                return normalized, True, False
-            last_normalized = normalized
+            if translated and contains_chinese(translated):
+                ok, err = is_valid_translation_format(translated)
+                if ok:
+                    print(f"  纠错阶段成功（模型自修）")
+                    return translated, True, False
+                # 再纠错一次
+                normalized = normalize_translation(translated)
+                ok2, _ = is_valid_translation_format(normalized)
+                if ok2:
+                    print(f"  纠错阶段成功（正则修复+模型自修）")
+                    return normalized, True, False
+                last_normalized = normalized
     except requests.exceptions.RequestException as e:
         status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
         if status is not None and 500 <= status < 600:
+            saw_server_error = True
             print(f"  纠错阶段请求错误 {status}，将尝试本地兜底")
-            return None, False, True
-        print(f"  纠错阶段请求出错: {e}")
+        else:
+            print(f"  纠错阶段请求出错: {e}")
     except Exception as e:
         print(f"  纠错阶段请求出错: {e}")
+
+    # 5xx 全部失败：跳过逐行兜底，直接走本地模型兜底
+    if saw_server_error and not last_normalized:
+        return None, False, True
 
     # 全部失败：返回最后一次纠错后的文本（让 main() 逐行兜底）
     if last_normalized:
