@@ -307,6 +307,12 @@ def main():
         print(f"进度已保存: {progress_path}")
         return 0
 
+    # 工作已完成，清理可能残留的 NEED_RESUME 标记
+    # （续作场景下从上一轮 artifact 下载的旧文件，不清理会导致后续 job 误判为未完成）
+    if os.path.exists(need_resume_marker):
+        os.remove(need_resume_marker)
+        print("[done] 清理旧的 NEED_RESUME 标记文件")
+
     if not audio_entries:
         print("错误: 没有成功生成任何配音")
         return 1
