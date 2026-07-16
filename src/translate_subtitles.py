@@ -16,7 +16,9 @@ import sys
 import time
 import json
 import argparse
+import threading
 from random import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -76,10 +78,14 @@ FALLBACK_SYSTEM_PROMPT = """# Role: 专业字幕翻译官
 # 本地兜底模型配置（API 失败时启用）
 FALLBACK_MODEL_REPO = "tencent/Hy-MT2-1.8B-GGUF"
 FALLBACK_MODEL_FILE = "Hy-MT2-1.8B-Q4_K_M.gguf"
+_LLM_SINGLETON = None            # 本地模型单例
+_LLM_LOAD_LOCK = threading.Lock()     # 保护模型加载
+_LLM_INFER_LOCK = threading.Lock()    # 保护推理（llama-cpp-python 非线程安全）
 
 
 completed_count = 0
 total_count = 0
+completed_lock = threading.Lock()     # 保护进度计数器
 
 # 字幕行格式: (HH:MM:SS.mmm) [Speaker 00] 文本
 LINE_PATTERN = re.compile(r'^\((\d{2}:\d{2}:\d{2}\.\d{3})\) \[([^\]]+)\] (.+)$')
@@ -170,48 +176,50 @@ def clean_content(content):
 
 
 # ----------------------------------------------------------------------
-# 本地 llama-cpp-python 兜底翻译
+# 本地 llama-cpp-python 兜底翻译（线程安全单例）
 # ----------------------------------------------------------------------
-_local_llm = None
 
 
 def get_local_llm():
-    """懒加载本地 llama-cpp-python 模型，仅在 API 失败时才加载。"""
-    global _local_llm
-    if _local_llm is not None:
-        return _local_llm
-    try:
-        from llama_cpp import Llama
-    except ImportError:
-        print("  [兜底] llama-cpp-python 未安装，无法本地兜底")
-        return None
-
-    # 优先使用 HF_HOME / HF_HUB_CACHE 等环境变量定位缓存
-    cache_dir = os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE") or None
-    print(f"  [兜底] 加载本地模型 {FALLBACK_MODEL_REPO}/{FALLBACK_MODEL_FILE} ...")
-    try:
-        _local_llm = Llama.from_pretrained(
-            repo_id=FALLBACK_MODEL_REPO,
-            filename=FALLBACK_MODEL_FILE,
-            cache_dir=cache_dir,
-            n_ctx=4096,
-            n_threads=4,
-            verbose=False,
-        )
-        print("  [兜底] 本地模型加载完成")
-    except Exception as e:
-        print(f"  [兜底] 本地模型加载失败: {e}")
-        _local_llm = None
-    return _local_llm
+    """懒加载本地 llama-cpp-python 模型（线程安全单例），仅在 API 失败时才加载。"""
+    global _LLM_SINGLETON
+    if _LLM_SINGLETON is not None:
+        return _LLM_SINGLETON
+    with _LLM_LOAD_LOCK:
+        if _LLM_SINGLETON is not None:
+            return _LLM_SINGLETON
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            print("  [兜底] llama-cpp-python 未安装，无法本地兜底")
+            return None
+        cache_dir = os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE") or None
+        print(f"  [兜底] 加载本地模型 {FALLBACK_MODEL_REPO}/{FALLBACK_MODEL_FILE} ...")
+        try:
+            _LLM_SINGLETON = Llama.from_pretrained(
+                repo_id=FALLBACK_MODEL_REPO,
+                filename=FALLBACK_MODEL_FILE,
+                cache_dir=cache_dir,
+                n_ctx=4096,
+                n_threads=4,
+                verbose=False,
+            )
+            print("  [兜底] 本地模型加载完成")
+        except Exception as e:
+            print(f"  [兜底] 本地模型加载失败: {e}")
+            _LLM_SINGLETON = None
+        return _LLM_SINGLETON
 
 
 def translate_segment_local(segment_text):
-    """用本地 llama 模型翻译一个段落，返回译文或 None。"""
+    """用本地 llama 模型翻译一个段落（线程安全），返回译文或 None。"""
     llm = get_local_llm()
     if llm is None:
         return None
     try:
-        resp = llm.create_chat_completion(
+        # llama-cpp-python 非线程安全，推理需串行
+        with _LLM_INFER_LOCK:
+            resp = llm.create_chat_completion(
             messages=[
                 {"role": "system", "content": FALLBACK_SYSTEM_PROMPT},
                 {"role": "user", "content": segment_text},
@@ -381,7 +389,7 @@ def translate_segment(segment_text, api_config, max_retries=5):
 
 
 def translate_worker(task, api_config):
-    """串行翻译工作函数。返回 (idx, translated, original_seg, normalized_flag)。
+    """并行翻译工作函数。返回 (idx, translated, original_seg, normalized_flag)。
 
     API 服务端错误（5xx）或重试耗尽仍无结果时，用本地 llama 兜底翻译。
     """
@@ -396,10 +404,13 @@ def translate_worker(task, api_config):
         if translated is not None:
             normalized = True  # 本地兜底结果视为已纠错
 
-    completed_count += 1
+    with completed_lock:
+        completed_count += 1
+        count = completed_count
+        total = total_count
     status = "成功" if translated else "失败"
     flag = "（已纠错/兜底）" if normalized else ""
-    print(f"[进度 {completed_count}/{total_count}] 段落 {idx + 1} {status}{flag}")
+    print(f"[进度 {count}/{total}] 段落 {idx + 1} {status}{flag}")
     return idx, translated, text, normalized
 
 
@@ -632,7 +643,7 @@ def main():
     print(f"读取 {len(lines)} 行字幕")
 
     segments = segment_lines(lines, segment_size=args.segment_size)
-    print(f"分为 {len(segments)} 段，串行顺序翻译")
+    print(f"分为 {len(segments)} 段，使用 {args.max_workers} 线程并行翻译")
 
     global completed_count, total_count
     completed_count = 0
@@ -641,10 +652,20 @@ def main():
     results = {}
     start_time = time.time()
 
-    # 串行顺序翻译（不并发请求 API）
-    for i, seg in enumerate(segments):
-        idx, translated, original_seg, normalized = translate_worker((i, seg), api_config)
-        results[idx] = (translated, original_seg, normalized)
+    # 多线程并发翻译
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        future_to_idx = {
+            executor.submit(translate_worker, (i, seg), api_config): i
+            for i, seg in enumerate(segments)
+        }
+        for future in as_completed(future_to_idx):
+            try:
+                idx, translated, original_seg, normalized = future.result()
+                results[idx] = (translated, original_seg, normalized)
+            except Exception as e:
+                idx = future_to_idx[future]
+                print(f"  段落 {idx + 1} 翻译异常: {e}")
+                results[idx] = (None, segments[idx], False)
 
     elapsed = time.time() - start_time
 
