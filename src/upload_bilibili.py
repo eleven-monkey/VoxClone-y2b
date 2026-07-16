@@ -18,7 +18,11 @@ import time
 import pickle
 import argparse
 import subprocess
+import threading
+from random import random
 from typing import Dict, Any
+
+import requests
 
 import requests
 from PIL import Image
@@ -170,58 +174,171 @@ def get_video_title(url, cookies_file=None):
     return None
 
 
+# 本地兜底模型配置（API 失败时启用，与 translate_subtitles.py 共享同一套）
+_FALLBACK_MODEL_REPO = "tencent/Hy-MT2-1.8B-GGUF"
+_FALLBACK_MODEL_FILE = "Hy-MT2-1.8B-Q4_K_M.gguf"
+_LLM_SINGLETON = None
+_LLM_LOAD_LOCK = threading.Lock()
+_LLM_INFER_LOCK = threading.Lock()
+
+_FALLBACK_SYSTEM_PROMPT_TITLE = """# Role: 专业字幕翻译官
+
+## 任务
+将英文视频标题翻译为中文，只输出标题本身。
+
+## 规则
+1. 只输出翻译后的中文标题，不要任何解释、注释或多余文字
+2. 不要使用 Markdown 格式
+3. 标题应符合中文表达习惯，吸引眼球
+"""
+
+_FALLBACK_SYSTEM_PROMPT_TAGS = """# Role: 视频内容标签专家
+
+## 任务
+根据视频标题生成 5 个左右中文关键词标签。
+
+## 输出格式
+逗号分隔的关键词列表，例如：关键词1,关键词2,关键词3
+
+只输出标签列表本身，不要多余文字。
+"""
+
+
+def _get_local_llm():
+    """懒加载本地 llama-cpp-python 模型（线程安全单例）。"""
+    global _LLM_SINGLETON
+    if _LLM_SINGLETON is not None:
+        return _LLM_SINGLETON
+    with _LLM_LOAD_LOCK:
+        if _LLM_SINGLETON is not None:
+            return _LLM_SINGLETON
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            return None
+        cache_dir = os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE") or None
+        try:
+            _LLM_SINGLETON = Llama.from_pretrained(
+                repo_id=_FALLBACK_MODEL_REPO,
+                filename=_FALLBACK_MODEL_FILE,
+                cache_dir=cache_dir,
+                n_ctx=4096,
+                n_threads=4,
+                verbose=False,
+            )
+        except Exception:
+            _LLM_SINGLETON = None
+        return _LLM_SINGLETON
+
+
+def _translate_with_local_llama(text, system_prompt, max_retries=1):
+    """用本地 llama 模型翻译一段文本，成功返回字符串，失败返回 None。"""
+    llm = _get_local_llm()
+    if llm is None:
+        return None
+    for attempt in range(max_retries):
+        try:
+            with _LLM_INFER_LOCK:
+                resp = llm.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text},
+                    ],
+                    max_tokens=4000,
+                    temperature=0.3,
+                    top_p=0.7,
+                )
+            content = resp["choices"][0]["message"]["content"]
+            if content and content.strip():
+                return content.replace("**", "").strip()
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+    return None
+
+
+def _call_llm_api(system_prompt, user_text, api_config, timeout=30):
+    """单次 LLM API 调用，成功返回文本，失败返回 None。"""
+    payload = {
+        "model": api_config["model_name"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_config['api_key']}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(api_config["url"], json=payload, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return content.replace("**", "").strip()
+    except Exception as e:
+        print(f"  API 调用失败: {e}")
+        return None
+
+
+def _llm_call_with_retry(system_prompt, user_text, api_config,
+                          fallback_system_prompt=None, max_retries=5):
+    """带重试和本地兜底的 LLM 调用。
+
+    流程：API 重试 max_retries 次（指数退避）→ 失败则本地 llama 兜底。
+    所有尝试都失败返回 None。
+    """
+    # 1. API 重试
+    for attempt in range(max_retries):
+        result = _call_llm_api(system_prompt, user_text, api_config, timeout=30)
+        if result:
+            return result
+        if attempt < max_retries - 1:
+            delay = 1 * (2 ** attempt) + random() * 0.5
+            print(f"  等待 {delay:.1f}s 后重试...")
+            time.sleep(delay)
+
+    # 2. 本地 llama 兜底
+    fs_prompt = fallback_system_prompt or system_prompt
+    print("  API 重试耗尽，尝试本地 llama 兜底...")
+    result = _translate_with_local_llama(user_text, fs_prompt)
+    if result:
+        print("  本地兜底成功")
+        return result
+
+    print("  本地兜底也失败")
+    return None
+
+
 def llm_translate_title(title, api_config):
-    """LLM 翻译标题为中文。"""
+    """LLM 翻译标题为中文，带重试和本地 llama 兜底。"""
     if not api_config.get("url") or not api_config.get("api_key"):
         print("警告: 未配置 AI API，使用原始标题")
         return title
-    system_prompt = "# role\n爆款视频up主\n\n## 任务\n将英文标题翻译成吸引眼球的爆款视频中文标题。\n\n## 输出格式\n直接给出翻译后的中文标题，不要其他文字"
-    payload = {
-        "model": api_config["model_name"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": title},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_config['api_key']}",
-        "Content-Type": "application/json",
-    }
-    try:
-        resp = requests.post(api_config["url"], json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        translated = resp.json()["choices"][0]["message"]["content"].replace("**", "").strip()
-        return translated or title
-    except Exception as e:
-        print(f"翻译标题出错: {e}，使用原始标题")
-        return title
+    system_prompt = ("# role\n爆款视频up主\n\n## 任务\n"
+                     "将英文标题翻译成吸引眼球的爆款视频中文标题。\n\n"
+                     "## 输出格式\n直接给出翻译后的中文标题，不要其他文字")
+    result = _llm_call_with_retry(
+        system_prompt, title, api_config,
+        fallback_system_prompt=_FALLBACK_SYSTEM_PROMPT_TITLE
+    )
+    return result or title
 
 
 def llm_generate_tags(title, api_config):
-    """LLM 根据标题生成标签。"""
+    """LLM 根据标题生成标签，带重试和本地 llama 兜底。"""
     if not api_config.get("url") or not api_config.get("api_key"):
         return ["科普"]
-    system_prompt = "# role\n视频内容标签专家\n\n## 任务\n根据标题生成5个左右中文关键词标签。\n\n## 输出格式\n逗号分隔的关键词列表，例如：关键词1,关键词2,关键词3"
-    payload = {
-        "model": api_config["model_name"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": title},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_config['api_key']}",
-        "Content-Type": "application/json",
-    }
-    try:
-        resp = requests.post(api_config["url"], json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        tags_raw = resp.json()["choices"][0]["message"]["content"].replace("**", "").strip()
-        tags_list = [t.strip() for t in tags_raw.replace("，", ",").split(",") if t.strip()]
-        return tags_list or ["科普"]
-    except Exception as e:
-        print(f"生成标签出错: {e}")
+    system_prompt = ("# role\n视频内容标签专家\n\n## 任务\n"
+                     "根据标题生成5个左右中文关键词标签。\n\n"
+                     "## 输出格式\n逗号分隔的关键词列表，例如：关键词1,关键词2,关键词3")
+    result = _llm_call_with_retry(
+        system_prompt, title, api_config,
+        fallback_system_prompt=_FALLBACK_SYSTEM_PROMPT_TAGS
+    )
+    if not result:
         return ["科普"]
+    tags_list = [t.strip() for t in result.replace("，", ",").split(",") if t.strip()]
+    return tags_list or ["科普"]
 
 
 def generate_upload_config(url, api_config, cookies_file=None):
