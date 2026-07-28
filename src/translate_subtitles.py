@@ -666,7 +666,7 @@ def main():
     parser.add_argument("--api_key", default=os.environ.get("AI_API_KEY", ""), help="LLM API Key")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL", "THUDM/GLM-4-9B-0414"), help="模型名")
     parser.add_argument("--segment_size", type=int, default=10, help="每段最大行数")
-    parser.add_argument("--max_workers", type=int, default=5, help="并行线程数")
+    parser.add_argument("--max_workers", type=int, default=2, help="并行线程数")
     args = parser.parse_args()
 
     if not args.api_url or not args.api_key:
