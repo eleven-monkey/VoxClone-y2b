@@ -123,13 +123,43 @@ def contains_chinese(text):
 
 
 def normalize_translation(text):
-    """纠错：把 [Speaker XX) 这种开口[闭口)的不匹配括号统一修复为 [Speaker XX]。
-    只处理这一种已知错误，其他情况不乱动。
+    """自动纠错常见的翻译格式错误（时间戳、说话人标签、多余序号等）。
+
+    支持纠错项：
+    1. 移除行首 Markdown 序号或无用前缀（如 '1. ', '- '）
+    2. 时间戳格式纠错：
+       - (HH:MM:SS:mmm) 或 (HH:MM:SS,mmm) → (HH:MM:SS.mmm) （毫秒分隔符误用冒号或逗号）
+       - (MM:SS:mmm) 或 (MM:SS.mmm) → (00:MM:SS.mmm) （缺少小时前缀）
+       - 全角括号 （HH:MM:SS.mmm） → 半角括号 (HH:MM:SS.mmm)
+       - 数字位数未填零自动补齐（如 0:1:28.47 → 00:01:28.470）
+    3. 说话人标签纠错：
+       - [Speaker XX) → [Speaker XX] （开口/闭口括号不匹配）
+       - 【Speaker XX】 → [Speaker XX] （中文全角方括号）
     """
     if not text:
         return text
-    # 修复 [xxx) → [xxx]
-    text = re.sub(r'\[([^\]\n]+?)\)', r'[\1]', text)
+
+    # 1. 移除行首 Markdown 序号（如 "1. (00:01:28.047)..." 或 "- (00:01:28.047)..."）
+    text = re.sub(r'^\s*(?:\d+[\.\、]|-|\*)\s*([\(\（])', r'\1', text, flags=re.MULTILINE)
+
+    # 2. 修复时间戳
+    # 2.1 4段式时间戳 (HH:MM:SS:mmm), (HH:MM:SS,mmm), 全角括号或位数不足
+    def _fix_ts_4parts(m):
+        hh, mm, ss, ms = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"({hh.zfill(2)}:{mm.zfill(2)}:{ss.zfill(2)}.{ms.ljust(3, '0')[:3]})"
+
+    text = re.sub(r'[\(（](\d{1,2}):(\d{1,2}):(\d{1,2})[:,.](\d{1,3})[\)）]', _fix_ts_4parts, text)
+
+    # 2.2 3段式时间戳 (MM:SS:mmm), (MM:SS.mmm) （补齐小时 00:）
+    def _fix_ts_3parts(m):
+        mm, ss, ms = m.group(1), m.group(2), m.group(3)
+        return f"(00:{mm.zfill(2)}:{ss.zfill(2)}.{ms.ljust(3, '0')[:3]})"
+
+    text = re.sub(r'(?<!:\d{2})[\(（](\d{1,2}):(\d{1,2})[:,.](\d{1,3})[\)）]', _fix_ts_3parts, text)
+
+    # 3. 修复说话人标签
+    text = re.sub(r'[【\[]([^\n\]】]+?)[】\)]', r'[\1]', text)
+
     return text
 
 
@@ -235,6 +265,11 @@ def translate_segment_local(segment_text):
             return None
         ok, err = is_valid_translation_format(translated)
         if not ok:
+            normalized = normalize_translation(translated)
+            ok_norm, _ = is_valid_translation_format(normalized)
+            if ok_norm:
+                print("  [兜底] 本地翻译正则自动纠错成功")
+                return normalized
             print(f"  [兜底] 格式校验失败: {err}")
             return None
         return translated
@@ -301,6 +336,11 @@ def translate_segment(segment_text, api_config, max_retries=5):
 
             ok, err = is_valid_translation_format(translated)
             if not ok:
+                normalized = normalize_translation(translated)
+                ok_norm, _ = is_valid_translation_format(normalized)
+                if ok_norm:
+                    print(f"  格式校验自动纠错成功 (尝试 {attempt + 1}/{max_retries})")
+                    return normalized, True, False
                 print(f"  格式校验失败 (尝试 {attempt + 1}/{max_retries}): {err}")
                 continue
 
@@ -692,6 +732,12 @@ def main():
                 print(f"  [译文合并] 段落 {i + 1}：译文{len(trans_lines)}行/原{len(original_lines)}行（合并翻译，跳过缺行）")
             for j, (tl, ol) in enumerate(zip(trans_lines, original_lines)):
                 ok, _ = is_valid_translation_format(tl)
+                if not ok:
+                    tl_norm = normalize_translation(tl)
+                    ok_norm, _ = is_valid_translation_format(tl_norm)
+                    if ok_norm:
+                        tl = tl_norm
+                        ok = True
                 if ok and contains_chinese(_extract_text_after_speaker(tl)):
                     translated_lines.append(tl)
                 else:

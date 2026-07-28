@@ -28,9 +28,9 @@ def parse_timestamp(timestamp):
     """将时间戳字符串转换为毫秒。
 
     支持 (h:mm:ss), (hh:mm:ss), (mm:ss), (h:mm:ss.ms), (hh:mm:ss.ms), (mm:ss.ms)
-    以及三位数分钟，例如 (123:34.56)
+    以及三位数分钟，例如 (123:34.56)，并兼容冒号/逗号分隔毫秒如 (00:01:28:047)
     """
-    match = re.match(r'[\(（](?:(\d{1,2}):)?(\d{1,3}):(\d{1,2})(?:\.(\d{1,3}))?[\)）]', timestamp)
+    match = re.match(r'[\(（](?:(\d{1,2}):)?(\d{1,3}):(\d{1,2})(?:[.:,](\d{1,3}))?[\)）]', timestamp)
     if match:
         hours, minutes, seconds, milliseconds = match.groups()
         total_ms = 0
@@ -56,7 +56,7 @@ def split_text_by_timestamp(text):
     """
     # 行格式: (时间戳) [Speaker XX] 正文  或  (时间戳) 正文
     line_pattern = re.compile(
-        r'[\(（](?P<ts>\d{1,2}:\d{2}:\d{2}\.\d{1,3}|\d{1,2}:\d{2}:\d{2}|\d{1,3}:\d{2}(?:\.\d{1,3})?)[\)）]'
+        r'[\(（](?P<ts>\d{1,2}:\d{2}:\d{2}(?:[.:,]\d{1,3})?|\d{1,2}:\d{2}:\d{2}|\d{1,3}:\d{2}(?:[.:,]\d{1,3})?)[\)）]'
         r'(?:\s*\[(?P<speaker>[^\]]+)\])?'
         r'\s*(?P<content>.+)'
     )
