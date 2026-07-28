@@ -127,12 +127,13 @@ def normalize_translation(text):
 
     支持纠错项：
     1. 移除行首 Markdown 序号或无用前缀（如 '1. ', '- '）
-    2. 时间戳格式纠错：
+    2. 丢弃无内容时间戳行（模型合并翻译时留下的无正文空时间戳）
+    3. 时间戳格式纠错：
        - (HH:MM:SS:mmm) 或 (HH:MM:SS,mmm) → (HH:MM:SS.mmm) （毫秒分隔符误用冒号或逗号）
        - (MM:SS:mmm) 或 (MM:SS.mmm) → (00:MM:SS.mmm) （缺少小时前缀）
        - 全角括号 （HH:MM:SS.mmm） → 半角括号 (HH:MM:SS.mmm)
        - 数字位数未填零自动补齐（如 0:1:28.47 → 00:01:28.470）
-    3. 说话人标签纠错：
+    4. 说话人标签纠错：
        - [Speaker XX) → [Speaker XX] （开口/闭口括号不匹配）
        - 【Speaker XX】 → [Speaker XX] （中文全角方括号）
     """
@@ -142,22 +143,33 @@ def normalize_translation(text):
     # 1. 移除行首 Markdown 序号（如 "1. (00:01:28.047)..." 或 "- (00:01:28.047)..."）
     text = re.sub(r'^\s*(?:\d+[\.\、]|-|\*)\s*([\(\（])', r'\1', text, flags=re.MULTILINE)
 
-    # 2. 修复时间戳
-    # 2.1 4段式时间戳 (HH:MM:SS:mmm), (HH:MM:SS,mmm), 全角括号或位数不足
+    # 2. 丢弃仅包含时间戳和 Speaker 标签、无任何正文内容的行（模型合并翻译残留的空时间戳）
+    clean_lines = []
+    for line in text.splitlines():
+        line_str = line.strip()
+        if not line_str:
+            continue
+        if re.match(r'^[\(（]\d{1,2}:\d{2}:\d{2}[:.,]\d{1,3}[\)）]\s*(?:\[[^\]]+\])?\s*$', line_str):
+            continue
+        clean_lines.append(line_str)
+    text = "\n".join(clean_lines)
+
+    # 3. 修复时间戳
+    # 3.1 4段式时间戳 (HH:MM:SS:mmm), (HH:MM:SS,mmm), 全角括号或位数不足
     def _fix_ts_4parts(m):
         hh, mm, ss, ms = m.group(1), m.group(2), m.group(3), m.group(4)
         return f"({hh.zfill(2)}:{mm.zfill(2)}:{ss.zfill(2)}.{ms.ljust(3, '0')[:3]})"
 
     text = re.sub(r'[\(（](\d{1,2}):(\d{1,2}):(\d{1,2})[:,.](\d{1,3})[\)）]', _fix_ts_4parts, text)
 
-    # 2.2 3段式时间戳 (MM:SS:mmm), (MM:SS.mmm) （补齐小时 00:）
+    # 3.2 3段式时间戳 (MM:SS:mmm), (MM:SS.mmm) （补齐小时 00:）
     def _fix_ts_3parts(m):
         mm, ss, ms = m.group(1), m.group(2), m.group(3)
         return f"(00:{mm.zfill(2)}:{ss.zfill(2)}.{ms.ljust(3, '0')[:3]})"
 
     text = re.sub(r'(?<!:\d{2})[\(（](\d{1,2}):(\d{1,2})[:,.](\d{1,3})[\)）]', _fix_ts_3parts, text)
 
-    # 3. 修复说话人标签
+    # 4. 修复说话人标签
     text = re.sub(r'[【\[]([^\n\]】]+?)[】\)]', r'[\1]', text)
 
     return text
@@ -181,6 +193,8 @@ def is_valid_translation_format(text):
     prev_ts = None
     for i, line in enumerate(lines, 1):
         if not LINE_PATTERN.match(line):
+            if re.match(r'^\(\d{2}:\d{2}:\d{2}\.\d{3}\)\s*\[[^\]]+\]\s*$', line):
+                return False, f"第{i}行缺失正文内容: {line[:80]}"
             return False, f"第{i}行格式不正确: {line[:80]}"
         # 提取时间戳，检查严格递增
         ts_match = re.search(r'\((\d{2}:\d{2}:\d{2}\.\d{3})\)', line)
