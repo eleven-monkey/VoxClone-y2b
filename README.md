@@ -24,11 +24,13 @@ Job4: 视频合成+上传   →  B站
 
 在仓库 **Settings → Secrets and variables → Actions** 中添加以下 Secrets：
 
-| Secret | 说明 | 获取方式 |
+| Secret | 说明 | 获取方式 / 示例 |
 | --- | --- | --- |
-| `AI_API_URL` | LLM 接口地址 | SiliconFlow: `https://api.siliconflow.cn/v1/chat/completions` |
-| `AI_API_KEY` | LLM API Key | SiliconFlow 控制台获取 |
-| `AI_MODEL` | 翻译用模型名 | 如 `THUDM/GLM-4-9B-0414`、`Qwen/Qwen3-8B` |
+| `AI_API_URL` | 默认 OpenAI 兼容接口地址 | SiliconFlow: `https://api.siliconflow.cn/v1/chat/completions` |
+| `AI_API_KEY` | 默认 LLM API Key | SiliconFlow 控制台获取 |
+| `AI_MODEL` | 默认翻译模型名 | 如 `THUDM/GLM-4-9B-0414`、`Qwen/Qwen3-8B` |
+| `API_KEY_gemini` | Google Gemini API Key | Google AI Studio 获取（使用 Gemini 时配置） |
+| `API_MODEL_gemini` | Gemini 模型名（可选） | 默认 `gemini-2.0-flash` |
 | `BILIBILI_SESSDATA` | B站 sessdata | 浏览器登录 B 站后从 Cookie 获取 |
 | `BILIBILI_JCT` | B站 bili_jct | 同上（CSRF token） |
 | `BILIBILI_BUVID3` | B站 buvid3 | 同上 |
@@ -43,7 +45,9 @@ Job4: 视频合成+上传   →  B站
 
 - `video_url`：YouTube 视频 URL（必填）
 - `max_speakers`：最大说话人数量（可选，留空自动检测）
-- `translate_model`：翻译模型名（可选，留空用 `AI_MODEL`）
+- `translate_model`：翻译模型名（可选，留空用 Secret 配置）
+- `api_config_name`：选择 API 渠道（`default` / `gemini` / `siliconflow` 等，选用 `gemini` 时调用 Google Gemini API）
+
 
 ### 3. 等待完成
 

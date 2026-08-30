@@ -13,10 +13,20 @@ on:
         default: ''
         type: string
       translate_model:
-        description: '翻译用 LLM 模型名（留空用 AI_MODEL secret）'
+        description: '翻译用 LLM 模型名（留空用 AI_MODEL / API_MODEL_* secret）'
         required: false
         default: ''
         type: string
+      api_config_name:
+        description: 'API 配置名称（如 default, gemini, siliconflow 等）'
+        required: false
+        default: 'default'
+        type: choice
+        options:
+          - default
+          - gemini
+          - siliconflow
+
 
 # 防止并发运行冲突
 concurrency:
@@ -161,10 +171,43 @@ jobs:
       - name: 安装依赖
         run: |
           pip install -r requirements/common.txt
+          pip install google-genai
           # 安装 llama-cpp-python CPU 预编译版，用于 API 失败时本地兜底翻译
           pip install llama-cpp-python --no-cache-dir --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
           # huggingface_hub 用于 Llama.from_pretrained 下载 GGUF 模型
           pip install "huggingface_hub>=0.20,<0.30"
+
+      - name: 生成 API 配置文件
+        env:
+          API_NAME: ${{ inputs.api_config_name || 'default' }}
+          API_CONFIG_NAME: ${{ inputs.api_config_name || 'default' }}
+        run: |
+          mkdir -p config
+          URL="${{ secrets[format('API_URL_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_URL }}"
+          KEY="${{ secrets[format('API_KEY_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_KEY }}"
+          CUSTOM_MODEL="${{ inputs.translate_model }}"
+          SECRET_MODEL="${{ secrets[format('API_MODEL_{0}', inputs.api_config_name || 'default')] || secrets.AI_MODEL }}"
+          if [ -n "$CUSTOM_MODEL" ]; then
+            MODEL="$CUSTOM_MODEL"
+          elif [ -n "$SECRET_MODEL" ]; then
+            MODEL="$SECRET_MODEL"
+          elif [ "$API_CONFIG_NAME" = "gemini" ]; then
+            MODEL="gemini-2.0-flash"
+          else
+            MODEL="THUDM/GLM-4-9B-0414"
+          fi
+
+          TYPE="${{ (inputs.api_config_name == 'gemini' || env.API_CONFIG_NAME == 'gemini') && 'gemini' || 'openai' }}"
+
+          cat > config/api_config.json <<EOF
+          {
+            "url": "$URL",
+            "api_key": "$KEY",
+            "model_name": "$MODEL",
+            "type": "$TYPE"
+          }
+          EOF
+          cp config/api_config.json api_config.json
 
       - name: 下载 ASR 产物
         uses: actions/download-artifact@v4
@@ -173,17 +216,12 @@ jobs:
           path: work/
 
       - name: 翻译字幕
-        env:
-          TRANSLATE_MODEL: ${{ inputs.translate_model }}
         run: |
-          MODEL="$TRANSLATE_MODEL"
-          if [ -z "$MODEL" ]; then MODEL="${AI_MODEL}"; fi
           python src/translate_subtitles.py \
             --input work/word_level.txt \
             --output work/word_level_translated.txt \
-            --api_url "${AI_API_URL}" \
-            --api_key "${AI_API_KEY}" \
-            --model "$MODEL"
+            --api_config config/api_config.json \
+            --max_workers 4
 
       - name: 上传翻译产物
         uses: actions/upload-artifact@v4
@@ -722,7 +760,41 @@ jobs:
           key: pip-upload-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/common.txt') }}
 
       - name: 安装依赖
-        run: pip install -r requirements/common.txt
+        run: |
+          pip install -r requirements/common.txt
+          pip install google-genai
+
+      - name: 生成 API 配置文件
+        env:
+          API_NAME: ${{ inputs.api_config_name || 'default' }}
+          API_CONFIG_NAME: ${{ inputs.api_config_name || 'default' }}
+        run: |
+          mkdir -p config
+          URL="${{ secrets[format('API_URL_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_URL }}"
+          KEY="${{ secrets[format('API_KEY_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_KEY }}"
+          CUSTOM_MODEL="${{ inputs.translate_model }}"
+          SECRET_MODEL="${{ secrets[format('API_MODEL_{0}', inputs.api_config_name || 'default')] || secrets.AI_MODEL }}"
+          if [ -n "$CUSTOM_MODEL" ]; then
+            MODEL="$CUSTOM_MODEL"
+          elif [ -n "$SECRET_MODEL" ]; then
+            MODEL="$SECRET_MODEL"
+          elif [ "$API_CONFIG_NAME" = "gemini" ]; then
+            MODEL="gemini-2.0-flash"
+          else
+            MODEL="THUDM/GLM-4-9B-0414"
+          fi
+
+          TYPE="${{ (inputs.api_config_name == 'gemini' || env.API_CONFIG_NAME == 'gemini') && 'gemini' || 'openai' }}"
+
+          cat > config/api_config.json <<EOF
+          {
+            "url": "$URL",
+            "api_key": "$KEY",
+            "model_name": "$MODEL",
+            "type": "$TYPE"
+          }
+          EOF
+          cp config/api_config.json api_config.json
 
       - name: 升级 yt-dlp
         run: pip install -U yt-dlp

@@ -3,3 +3,4 @@ requests
 Pillow
 bilibili-api-python
 httpx
+google-genai

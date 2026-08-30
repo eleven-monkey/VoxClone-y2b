@@ -38,11 +38,15 @@ def load_api_config(config_file):
                 config = json.load(f) or {}
         except Exception as e:
             print(f"读取配置文件出错: {e}")
+    api_type = (config.get("type") or os.environ.get("AI_API_TYPE", "openai")).lower()
+    default_model = "gemini-2.0-flash" if api_type == "gemini" else "THUDM/GLM-4-9B-0414"
     return {
+        "type": api_type,
         "url": config.get("url") or os.environ.get("AI_API_URL", ""),
         "api_key": config.get("api_key") or os.environ.get("AI_API_KEY", ""),
-        "model_name": config.get("model_name") or os.environ.get("AI_MODEL", "THUDM/GLM-4-9B-0414"),
+        "model_name": config.get("model_name") or os.environ.get("AI_MODEL", default_model),
     }
+
 
 
 def download_youtube_video(url, output_path, cookies_file=None):
@@ -257,8 +261,33 @@ def _translate_with_local_llama(text, system_prompt, max_retries=1):
     return None
 
 
+def _call_gemini_api(system_prompt, user_text, api_config):
+    """单次 Gemini API 调用，成功返回文本，失败返回 None。"""
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_config.get("api_key", ""))
+        response = client.models.generate_content(
+            model=api_config.get("model_name", "gemini-2.0-flash"),
+            contents=user_text,
+            config={
+                "system_instruction": system_prompt,
+                "max_output_tokens": 4000,
+                "temperature": 0.3,
+                "top_p": 0.7,
+            },
+        )
+        content = getattr(response, "text", "") or ""
+        return content.replace("**", "").strip() if content else None
+    except Exception as e:
+        print(f"  Gemini API 调用失败: {e}")
+        return None
+
+
 def _call_llm_api(system_prompt, user_text, api_config, timeout=30):
-    """单次 LLM API 调用，成功返回文本，失败返回 None。"""
+    """单次 LLM API 调用，根据 type 走 Gemini 或 OpenAI，成功返回文本，失败返回 None。"""
+    if api_config.get("type") == "gemini":
+        return _call_gemini_api(system_prompt, user_text, api_config)
+
     payload = {
         "model": api_config["model_name"],
         "messages": [
@@ -278,6 +307,15 @@ def _call_llm_api(system_prompt, user_text, api_config, timeout=30):
     except Exception as e:
         print(f"  API 调用失败: {e}")
         return None
+
+
+def _is_api_configured(api_config):
+    """检查 API 是否已有效配置。"""
+    if not api_config:
+        return False
+    if api_config.get("type") == "gemini":
+        return bool(api_config.get("api_key"))
+    return bool(api_config.get("url") and api_config.get("api_key"))
 
 
 def _llm_call_with_retry(system_prompt, user_text, api_config,
@@ -311,7 +349,7 @@ def _llm_call_with_retry(system_prompt, user_text, api_config,
 
 def llm_translate_title(title, api_config):
     """LLM 翻译标题为中文，带重试和本地 llama 兜底。"""
-    if not api_config.get("url") or not api_config.get("api_key"):
+    if not _is_api_configured(api_config):
         print("警告: 未配置 AI API，使用原始标题")
         return title
     system_prompt = ("# role\n爆款视频up主\n\n## 任务\n"
@@ -326,7 +364,7 @@ def llm_translate_title(title, api_config):
 
 def llm_generate_tags(title, api_config):
     """LLM 根据标题生成标签，带重试和本地 llama 兜底。"""
-    if not api_config.get("url") or not api_config.get("api_key"):
+    if not _is_api_configured(api_config):
         return ["科普"]
     system_prompt = ("# role\n视频内容标签专家\n\n## 任务\n"
                      "根据标题生成5个左右中文关键词标签。\n\n"

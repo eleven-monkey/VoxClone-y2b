@@ -292,14 +292,54 @@ def translate_segment_local(segment_text):
         return None
 
 
-def translate_segment(segment_text, api_config, max_retries=5):
-    """翻译一个段落，返回 (译文, normalized_flag, server_error)。
+def load_api_config(config_file=None, api_url=None, api_key=None, model_name=None, api_type=None):
+    """加载 API 配置，优先级：显式参数 > 环境变量 > 配置文件 > 默认值。"""
+    config = {}
+    if config_file and os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config = json.load(f) or {}
+        except Exception as e:
+            print(f"读取配置文件出错: {e}")
+
+    final_type = (api_type or os.environ.get("AI_API_TYPE") or config.get("type") or "openai").lower()
+    final_url = api_url or os.environ.get("AI_API_URL") or config.get("url") or ""
+    final_key = api_key or os.environ.get("AI_API_KEY") or config.get("api_key") or ""
+    final_model = model_name or os.environ.get("AI_MODEL") or config.get("model_name") or ""
+
+    if not final_model:
+        final_model = "gemini-2.0-flash" if final_type == "gemini" else "THUDM/GLM-4-9B-0414"
+
+    return {
+        "type": final_type,
+        "url": final_url,
+        "api_key": final_key,
+        "model_name": final_model,
+    }
+
+
+def is_api_config_valid(api_config):
+    """检查 API 配置是否满足基本要求。"""
+    if not api_config:
+        return False, "未提供 API 配置"
+    api_type = api_config.get("type", "openai")
+    api_key = api_config.get("api_key")
+    if not api_key:
+        return False, f"缺少 API Key ({'API_KEY_gemini' if api_type == 'gemini' else 'AI_API_KEY'})"
+    if api_type != "gemini":
+        if not api_config.get("url"):
+            return False, "OpenAI 兼容模式缺少 api_url (AI_API_URL)"
+    return True, "配置有效"
+
+
+def translate_segment_openai(segment_text, api_config, max_retries=5):
+    """使用 OpenAI 兼容 API 翻译一个段落，返回 (译文, normalized_flag, server_error)。
 
     - 成功：(译文, False/True, False)
     - 全部重试 + 纠错都失败：返回最后一次文本（让调用方逐行兜底）
     - API 服务端持续错误（5xx 贯穿 max_retries + 纠错阶段）：返回 (None, False, True) 让调用方走本地模型兜底
     """
-    global completed_count
+    global completed_count, total_count
     url = api_config["url"]
     headers = {
         "Content-Type": "application/json",
@@ -440,6 +480,133 @@ def translate_segment(segment_text, api_config, max_retries=5):
     if last_normalized:
         return last_normalized, True, False
     return last_translated, True, False  # 可能为 None，但保持三元组契约
+
+
+def translate_segment_gemini(segment_text, api_config, max_retries=5):
+    """使用 Google Gemini API (google-genai SDK 2.0 规范) 翻译一个段落。
+
+    返回 (译文, normalized_flag, server_error)。
+    """
+    global completed_count, total_count
+    try:
+        from google import genai
+    except ImportError:
+        print("  [Gemini] 未安装 google-genai SDK，请运行 pip install google-genai")
+        return None, False, True
+
+    api_key = api_config.get("api_key", "")
+    model_name = api_config.get("model_name", "gemini-2.0-flash")
+    client = genai.Client(api_key=api_key)
+
+    last_translated = None
+    last_normalized = None
+    saw_server_error = False
+
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                delay = 1 * (2 ** (attempt - 1)) + random() * 0.5
+                time.sleep(delay)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=segment_text,
+                config={
+                    "system_instruction": SYSTEM_PROMPT,
+                    "max_output_tokens": 4000,
+                    "temperature": 0.3,
+                    "top_p": 0.7,
+                },
+            )
+            translated = getattr(response, "text", "") or ""
+            translated = filter_think_tags(translated)
+            last_translated = translated
+
+            if not translated or not contains_chinese(translated):
+                print(f"  [Gemini] 翻译未含中文 (尝试 {attempt + 1}/{max_retries})")
+                continue
+
+            ok, err = is_valid_translation_format(translated)
+            if not ok:
+                normalized = normalize_translation(translated)
+                ok_norm, _ = is_valid_translation_format(normalized)
+                if ok_norm:
+                    print(f"  [Gemini] 格式校验自动纠错成功 (尝试 {attempt + 1}/{max_retries})")
+                    return normalized, True, False
+                print(f"  [Gemini] 格式校验失败 (尝试 {attempt + 1}/{max_retries}): {err}")
+                continue
+
+            return translated, False, False
+
+        except Exception as e:
+            saw_server_error = True
+            print(f"  [Gemini] API 请求错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            continue
+
+    # 5 次都失败：进入纠错阶段
+    if saw_server_error and not last_translated:
+        print(f"  [Gemini] 重试 {max_retries} 次均为请求错误，跳过纠错阶段，直接走本地兜底")
+        return None, False, True
+
+    # 先对最后一次返回纠错
+    if last_translated:
+        normalized = normalize_translation(last_translated)
+        if normalized != last_translated:
+            last_normalized = normalized
+            ok, err = is_valid_translation_format(normalized)
+            if ok:
+                print(f"  [Gemini] 纠错后格式通过（无需再请求）")
+                return normalized, True, False
+            print(f"  [Gemini] 纠错后仍不通过: {err}，再请求 1 次让模型自修")
+        else:
+            print(f"  [Gemini] 5 次重试后仍未通过且无可纠错项，再请求 1 次")
+
+    # 再请求 1 次，让模型自己修复
+    try:
+        time.sleep(1)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=segment_text,
+            config={
+                "system_instruction": SYSTEM_PROMPT,
+                "max_output_tokens": 4000,
+                "temperature": 0.3,
+                "top_p": 0.7,
+            },
+        )
+        translated = getattr(response, "text", "") or ""
+        translated = filter_think_tags(translated)
+        last_translated = translated
+
+        if translated and contains_chinese(translated):
+            ok, err = is_valid_translation_format(translated)
+            if ok:
+                print(f"  [Gemini] 纠错阶段成功（模型自修）")
+                return translated, True, False
+            normalized = normalize_translation(translated)
+            ok2, _ = is_valid_translation_format(normalized)
+            if ok2:
+                print(f"  [Gemini] 纠错阶段成功（正则修复+模型自修）")
+                return normalized, True, False
+            last_normalized = normalized
+    except Exception as e:
+        saw_server_error = True
+        print(f"  [Gemini] 纠错阶段请求出错: {e}")
+
+    # 失败判断
+    if saw_server_error and not last_normalized:
+        return None, False, True
+
+    if last_normalized:
+        return last_normalized, True, False
+    return last_translated, True, False
+
+
+def translate_segment(segment_text, api_config, max_retries=5):
+    """翻译一个段落，根据 api_config['type'] 分发到 Gemini 或 OpenAI 实现。"""
+    if api_config.get("type") == "gemini":
+        return translate_segment_gemini(segment_text, api_config, max_retries=max_retries)
+    return translate_segment_openai(segment_text, api_config, max_retries=max_retries)
+
 
 
 def translate_worker(task, api_config):
@@ -676,22 +843,29 @@ def main():
     parser = argparse.ArgumentParser(description="LLM 并行字幕翻译")
     parser.add_argument("--input", required=True, help="输入字幕文件")
     parser.add_argument("--output", required=True, help="输出翻译字幕文件")
-    parser.add_argument("--api_url", default=os.environ.get("AI_API_URL", ""), help="LLM API URL")
-    parser.add_argument("--api_key", default=os.environ.get("AI_API_KEY", ""), help="LLM API Key")
-    parser.add_argument("--model", default=os.environ.get("AI_MODEL", "THUDM/GLM-4-9B-0414"), help="模型名")
+    parser.add_argument("--api_url", default=None, help="LLM API URL")
+    parser.add_argument("--api_key", default=None, help="LLM API Key")
+    parser.add_argument("--model", default=None, help="模型名")
+    parser.add_argument("--api_config", default="config/api_config.json", help="API 配置文件路径")
+    parser.add_argument("--api_type", default=None, help="API 类型 (openai 或 gemini)")
     parser.add_argument("--segment_size", type=int, default=10, help="每段最大行数")
     parser.add_argument("--max_workers", type=int, default=2, help="并行线程数")
     args = parser.parse_args()
 
-    if not args.api_url or not args.api_key:
-        print("错误: 缺少 --api_url 或 --api_key (或 AI_API_URL/AI_API_KEY 环境变量)")
+    api_config = load_api_config(
+        config_file=args.api_config,
+        api_url=args.api_url,
+        api_key=args.api_key,
+        model_name=args.model,
+        api_type=args.api_type,
+    )
+
+    valid, err_msg = is_api_config_valid(api_config)
+    if not valid:
+        print(f"错误: {err_msg}")
         return 1
 
-    api_config = {
-        "url": args.api_url,
-        "api_key": args.api_key,
-        "model_name": args.model,
-    }
+    print(f"API 类型: {api_config['type']}, 模型: {api_config['model_name']}")
 
     lines = read_lines(args.input)
     print(f"读取 {len(lines)} 行字幕")
