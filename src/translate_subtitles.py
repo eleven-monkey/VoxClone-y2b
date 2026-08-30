@@ -312,21 +312,21 @@ def load_api_config(config_file=None, api_url=None, api_key=None, model_name=Non
         except Exception as e:
             print(f"读取配置文件出错: {e}")
 
-    final_type = (api_type or os.environ.get("AI_API_TYPE") or config.get("type") or "openai").lower()
-    final_url = api_url or os.environ.get("AI_API_URL") or config.get("url") or ""
-    
-    # 支持多种环境变量与配置文件回退
+    final_type = (api_type or config.get("type") or os.environ.get("AI_API_TYPE") or "openai").lower()
+    final_url = api_url or config.get("url") or os.environ.get("AI_API_URL") or ""
+
+    # 支持多种环境变量与配置文件回退（优先使用显式参数与配置文件，再回退到环境变量）
     raw_key = (
         api_key
+        or config.get("api_key")
         or (os.environ.get("GEMINI_API_KEY") if final_type == "gemini" else None)
         or (os.environ.get("API_KEY_GEMINI") if final_type == "gemini" else None)
         or (os.environ.get("API_KEY_gemini") if final_type == "gemini" else None)
         or os.environ.get("AI_API_KEY")
-        or config.get("api_key")
         or ""
     )
     final_key = str(raw_key).strip().strip("'\"") if raw_key else ""
-    final_model = model_name or os.environ.get("AI_MODEL") or config.get("model_name") or ""
+    final_model = model_name or config.get("model_name") or os.environ.get("AI_MODEL") or ""
 
     if not final_model:
         final_model = "gemini-2.0-flash" if final_type == "gemini" else "THUDM/GLM-4-9B-0414"
