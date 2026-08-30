@@ -181,33 +181,119 @@ jobs:
         env:
           API_NAME: ${{ inputs.api_config_name || 'default' }}
           API_CONFIG_NAME: ${{ inputs.api_config_name || 'default' }}
+          CUSTOM_MODEL: ${{ inputs.translate_model }}
+          SECRET_API_KEY_SPECIFIC: ${{ secrets[format('API_KEY_{0}', inputs.api_config_name || 'default')] }}
+          SECRET_API_KEY_GEMINI_UPPER: ${{ secrets.API_KEY_GEMINI }}
+          SECRET_API_KEY_GEMINI_MIXED: ${{ secrets.API_KEY_gemini }}
+          SECRET_API_KEY_GEMINI_LOWER: ${{ secrets.api_key_gemini }}
+          SECRET_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SECRET_AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          SECRET_API_MODEL_SPECIFIC: ${{ secrets[format('API_MODEL_{0}', inputs.api_config_name || 'default')] }}
+          SECRET_API_MODEL_GEMINI_UPPER: ${{ secrets.API_MODEL_GEMINI }}
+          SECRET_API_MODEL_GEMINI_MIXED: ${{ secrets.API_MODEL_gemini }}
+          SECRET_API_MODEL_GEMINI_LOWER: ${{ secrets.api_model_gemini }}
+          SECRET_GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          SECRET_AI_MODEL: ${{ secrets.AI_MODEL }}
+          SECRET_API_URL_SPECIFIC: ${{ secrets[format('API_URL_{0}', inputs.api_config_name || 'default')] }}
+          SECRET_AI_API_URL: ${{ secrets.AI_API_URL }}
         run: |
-          mkdir -p config
-          URL="${{ secrets[format('API_URL_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_URL }}"
-          KEY="${{ secrets[format('API_KEY_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_KEY }}"
-          CUSTOM_MODEL="${{ inputs.translate_model }}"
-          SECRET_MODEL="${{ secrets[format('API_MODEL_{0}', inputs.api_config_name || 'default')] || secrets.AI_MODEL }}"
-          if [ -n "$CUSTOM_MODEL" ]; then
-            MODEL="$CUSTOM_MODEL"
-          elif [ -n "$SECRET_MODEL" ]; then
-            MODEL="$SECRET_MODEL"
-          elif [ "$API_CONFIG_NAME" = "gemini" ]; then
-            MODEL="gemini-2.0-flash"
-          else
-            MODEL="THUDM/GLM-4-9B-0414"
-          fi
+          python3 - <<'PYEOF'
+          import os
+          import json
 
-          TYPE="${{ (inputs.api_config_name == 'gemini' || env.API_CONFIG_NAME == 'gemini') && 'gemini' || 'openai' }}"
+          api_config_name = (os.environ.get("API_CONFIG_NAME") or "default").strip().lower()
+          custom_model = (os.environ.get("CUSTOM_MODEL") or "").strip()
 
-          cat > config/api_config.json <<EOF
-          {
-            "url": "$URL",
-            "api_key": "$KEY",
-            "model_name": "$MODEL",
-            "type": "$TYPE"
+          api_type = "gemini" if api_config_name == "gemini" else "openai"
+
+          api_key = ""
+          key_source = ""
+
+          if api_type == "gemini":
+              candidates = [
+                  ("API_KEY_" + api_config_name, os.environ.get("SECRET_API_KEY_SPECIFIC")),
+                  ("API_KEY_GEMINI", os.environ.get("SECRET_API_KEY_GEMINI_UPPER")),
+                  ("API_KEY_gemini", os.environ.get("SECRET_API_KEY_GEMINI_MIXED")),
+                  ("api_key_gemini", os.environ.get("SECRET_API_KEY_GEMINI_LOWER")),
+                  ("GEMINI_API_KEY", os.environ.get("SECRET_GEMINI_API_KEY")),
+                  ("AI_API_KEY", os.environ.get("SECRET_AI_API_KEY")),
+              ]
+              for name, val in candidates:
+                  if val and val.strip():
+                      api_key = val.strip().strip("'\"")
+                      key_source = name
+                      break
+          else:
+              candidates = [
+                  ("API_KEY_" + api_config_name, os.environ.get("SECRET_API_KEY_SPECIFIC")),
+                  ("AI_API_KEY", os.environ.get("SECRET_AI_API_KEY")),
+              ]
+              for name, val in candidates:
+                  if val and val.strip():
+                      api_key = val.strip().strip("'\"")
+                      key_source = name
+                      break
+
+          url = (os.environ.get("SECRET_API_URL_SPECIFIC") or "").strip() or (os.environ.get("SECRET_AI_API_URL") or "").strip()
+
+          model = ""
+          if custom_model:
+              model = custom_model
+          elif api_type == "gemini":
+              model_candidates = [
+                  os.environ.get("SECRET_API_MODEL_SPECIFIC"),
+                  os.environ.get("SECRET_API_MODEL_GEMINI_UPPER"),
+                  os.environ.get("SECRET_API_MODEL_GEMINI_MIXED"),
+                  os.environ.get("SECRET_API_MODEL_GEMINI_LOWER"),
+                  os.environ.get("SECRET_GEMINI_MODEL"),
+                  os.environ.get("SECRET_AI_MODEL"),
+              ]
+              for val in model_candidates:
+                  if val and val.strip():
+                      model = val.strip()
+                      break
+              if not model:
+                  model = "gemini-2.0-flash"
+          else:
+              model = (os.environ.get("SECRET_API_MODEL_SPECIFIC") or "").strip() or (os.environ.get("SECRET_AI_MODEL") or "").strip() or "THUDM/GLM-4-9B-0414"
+
+          def mask_key(k):
+              if not k:
+                  return "<EMPTY>"
+              if len(k) <= 8:
+                  return k[:2] + "****" + k[-2:]
+              return k[:4] + "****" + k[-4:]
+
+          print("================ [API 配置调试诊断] ================")
+          print(f"  渠道类型 (type):       {api_type} (输入配置: {api_config_name})")
+          print(f"  模型名称 (model_name): {model}")
+          print(f"  接口地址 (url):        {url if url else '(官方默认 SDK 地址)'}")
+          print(f"  密钥来源 (key_source): {key_source if key_source else '无匹配'}")
+          print(f"  密钥掩码 (api_key):    {mask_key(api_key)} (字符长度: {len(api_key)})")
+
+          if api_type == "gemini":
+              if not api_key:
+                  print("  [ERROR] 未找到 Gemini API Key！请在 GitHub 仓库 Settings -> Secrets -> Actions 中配置 API_KEY_GEMINI 或 API_KEY_gemini")
+              elif api_key.startswith("sk-"):
+                  print("  [WARNING] 当前为 Gemini 模式，但检测到 Key 以 'sk-' 开头（疑似 OpenAI/SiliconFlow 密钥）！")
+                  print("            请确认是否在 API_KEY_gemini 中误填了 SiliconFlow/OpenAI 的密钥。Gemini 密钥通常以 AIza 开头。")
+              elif not api_key.startswith("AIza"):
+                  print("  [INFO] 提示: 官方 Google AI Studio Gemini API Key 通常以 'AIza' 开头")
+          print("====================================================")
+
+          config_data = {
+              "url": url,
+              "api_key": api_key,
+              "model_name": model,
+              "type": api_type
           }
-          EOF
-          cp config/api_config.json api_config.json
+
+          os.makedirs("config", exist_ok=True)
+          with open("config/api_config.json", "w", encoding="utf-8") as f:
+              json.dump(config_data, f, indent=2, ensure_ascii=False)
+          with open("api_config.json", "w", encoding="utf-8") as f:
+              json.dump(config_data, f, indent=2, ensure_ascii=False)
+          PYEOF
 
       - name: 下载 ASR 产物
         uses: actions/download-artifact@v4
@@ -768,33 +854,119 @@ jobs:
         env:
           API_NAME: ${{ inputs.api_config_name || 'default' }}
           API_CONFIG_NAME: ${{ inputs.api_config_name || 'default' }}
+          CUSTOM_MODEL: ${{ inputs.translate_model }}
+          SECRET_API_KEY_SPECIFIC: ${{ secrets[format('API_KEY_{0}', inputs.api_config_name || 'default')] }}
+          SECRET_API_KEY_GEMINI_UPPER: ${{ secrets.API_KEY_GEMINI }}
+          SECRET_API_KEY_GEMINI_MIXED: ${{ secrets.API_KEY_gemini }}
+          SECRET_API_KEY_GEMINI_LOWER: ${{ secrets.api_key_gemini }}
+          SECRET_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SECRET_AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          SECRET_API_MODEL_SPECIFIC: ${{ secrets[format('API_MODEL_{0}', inputs.api_config_name || 'default')] }}
+          SECRET_API_MODEL_GEMINI_UPPER: ${{ secrets.API_MODEL_GEMINI }}
+          SECRET_API_MODEL_GEMINI_MIXED: ${{ secrets.API_MODEL_gemini }}
+          SECRET_API_MODEL_GEMINI_LOWER: ${{ secrets.api_model_gemini }}
+          SECRET_GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          SECRET_AI_MODEL: ${{ secrets.AI_MODEL }}
+          SECRET_API_URL_SPECIFIC: ${{ secrets[format('API_URL_{0}', inputs.api_config_name || 'default')] }}
+          SECRET_AI_API_URL: ${{ secrets.AI_API_URL }}
         run: |
-          mkdir -p config
-          URL="${{ secrets[format('API_URL_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_URL }}"
-          KEY="${{ secrets[format('API_KEY_{0}', inputs.api_config_name || 'default')] || secrets.AI_API_KEY }}"
-          CUSTOM_MODEL="${{ inputs.translate_model }}"
-          SECRET_MODEL="${{ secrets[format('API_MODEL_{0}', inputs.api_config_name || 'default')] || secrets.AI_MODEL }}"
-          if [ -n "$CUSTOM_MODEL" ]; then
-            MODEL="$CUSTOM_MODEL"
-          elif [ -n "$SECRET_MODEL" ]; then
-            MODEL="$SECRET_MODEL"
-          elif [ "$API_CONFIG_NAME" = "gemini" ]; then
-            MODEL="gemini-2.0-flash"
-          else
-            MODEL="THUDM/GLM-4-9B-0414"
-          fi
+          python3 - <<'PYEOF'
+          import os
+          import json
 
-          TYPE="${{ (inputs.api_config_name == 'gemini' || env.API_CONFIG_NAME == 'gemini') && 'gemini' || 'openai' }}"
+          api_config_name = (os.environ.get("API_CONFIG_NAME") or "default").strip().lower()
+          custom_model = (os.environ.get("CUSTOM_MODEL") or "").strip()
 
-          cat > config/api_config.json <<EOF
-          {
-            "url": "$URL",
-            "api_key": "$KEY",
-            "model_name": "$MODEL",
-            "type": "$TYPE"
+          api_type = "gemini" if api_config_name == "gemini" else "openai"
+
+          api_key = ""
+          key_source = ""
+
+          if api_type == "gemini":
+              candidates = [
+                  ("API_KEY_" + api_config_name, os.environ.get("SECRET_API_KEY_SPECIFIC")),
+                  ("API_KEY_GEMINI", os.environ.get("SECRET_API_KEY_GEMINI_UPPER")),
+                  ("API_KEY_gemini", os.environ.get("SECRET_API_KEY_GEMINI_MIXED")),
+                  ("api_key_gemini", os.environ.get("SECRET_API_KEY_GEMINI_LOWER")),
+                  ("GEMINI_API_KEY", os.environ.get("SECRET_GEMINI_API_KEY")),
+                  ("AI_API_KEY", os.environ.get("SECRET_AI_API_KEY")),
+              ]
+              for name, val in candidates:
+                  if val and val.strip():
+                      api_key = val.strip().strip("'\"")
+                      key_source = name
+                      break
+          else:
+              candidates = [
+                  ("API_KEY_" + api_config_name, os.environ.get("SECRET_API_KEY_SPECIFIC")),
+                  ("AI_API_KEY", os.environ.get("SECRET_AI_API_KEY")),
+              ]
+              for name, val in candidates:
+                  if val and val.strip():
+                      api_key = val.strip().strip("'\"")
+                      key_source = name
+                      break
+
+          url = (os.environ.get("SECRET_API_URL_SPECIFIC") or "").strip() or (os.environ.get("SECRET_AI_API_URL") or "").strip()
+
+          model = ""
+          if custom_model:
+              model = custom_model
+          elif api_type == "gemini":
+              model_candidates = [
+                  os.environ.get("SECRET_API_MODEL_SPECIFIC"),
+                  os.environ.get("SECRET_API_MODEL_GEMINI_UPPER"),
+                  os.environ.get("SECRET_API_MODEL_GEMINI_MIXED"),
+                  os.environ.get("SECRET_API_MODEL_GEMINI_LOWER"),
+                  os.environ.get("SECRET_GEMINI_MODEL"),
+                  os.environ.get("SECRET_AI_MODEL"),
+              ]
+              for val in model_candidates:
+                  if val and val.strip():
+                      model = val.strip()
+                      break
+              if not model:
+                  model = "gemini-2.0-flash"
+          else:
+              model = (os.environ.get("SECRET_API_MODEL_SPECIFIC") or "").strip() or (os.environ.get("SECRET_AI_MODEL") or "").strip() or "THUDM/GLM-4-9B-0414"
+
+          def mask_key(k):
+              if not k:
+                  return "<EMPTY>"
+              if len(k) <= 8:
+                  return k[:2] + "****" + k[-2:]
+              return k[:4] + "****" + k[-4:]
+
+          print("================ [API 配置调试诊断] ================")
+          print(f"  渠道类型 (type):       {api_type} (输入配置: {api_config_name})")
+          print(f"  模型名称 (model_name): {model}")
+          print(f"  接口地址 (url):        {url if url else '(官方默认 SDK 地址)'}")
+          print(f"  密钥来源 (key_source): {key_source if key_source else '无匹配'}")
+          print(f"  密钥掩码 (api_key):    {mask_key(api_key)} (字符长度: {len(api_key)})")
+
+          if api_type == "gemini":
+              if not api_key:
+                  print("  [ERROR] 未找到 Gemini API Key！请在 GitHub 仓库 Settings -> Secrets -> Actions 中配置 API_KEY_GEMINI 或 API_KEY_gemini")
+              elif api_key.startswith("sk-"):
+                  print("  [WARNING] 当前为 Gemini 模式，但检测到 Key 以 'sk-' 开头（疑似 OpenAI/SiliconFlow 密钥）！")
+                  print("            请确认是否在 API_KEY_gemini 中误填了 SiliconFlow/OpenAI 的密钥。Gemini 密钥通常以 AIza 开头。")
+              elif not api_key.startswith("AIza"):
+                  print("  [INFO] 提示: 官方 Google AI Studio Gemini API Key 通常以 'AIza' 开头")
+          print("====================================================")
+
+          config_data = {
+              "url": url,
+              "api_key": api_key,
+              "model_name": model,
+              "type": api_type
           }
-          EOF
-          cp config/api_config.json api_config.json
+
+          os.makedirs("config", exist_ok=True)
+          with open("config/api_config.json", "w", encoding="utf-8") as f:
+              json.dump(config_data, f, indent=2, ensure_ascii=False)
+          with open("api_config.json", "w", encoding="utf-8") as f:
+              json.dump(config_data, f, indent=2, ensure_ascii=False)
+          PYEOF
 
       - name: 升级 yt-dlp
         run: pip install -U yt-dlp

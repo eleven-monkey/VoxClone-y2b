@@ -29,6 +29,16 @@ from PIL import Image
 from bilibili_api import sync, video_uploader, Credential
 
 
+def mask_api_key(key):
+    """安全遮罩 API Key。"""
+    if not key:
+        return "<EMPTY>"
+    key = str(key).strip()
+    if len(key) <= 8:
+        return key[:2] + "****" + key[-2:]
+    return key[:4] + "****" + key[-4:]
+
+
 def load_api_config(config_file):
     """加载 API 配置，回退环境变量。"""
     config = {}
@@ -40,10 +50,18 @@ def load_api_config(config_file):
             print(f"读取配置文件出错: {e}")
     api_type = (config.get("type") or os.environ.get("AI_API_TYPE", "openai")).lower()
     default_model = "gemini-2.0-flash" if api_type == "gemini" else "THUDM/GLM-4-9B-0414"
+    raw_key = (
+        config.get("api_key")
+        or (os.environ.get("GEMINI_API_KEY") if api_type == "gemini" else None)
+        or (os.environ.get("API_KEY_GEMINI") if api_type == "gemini" else None)
+        or (os.environ.get("API_KEY_gemini") if api_type == "gemini" else None)
+        or os.environ.get("AI_API_KEY", "")
+    )
+    final_key = str(raw_key).strip().strip("'\"") if raw_key else ""
     return {
         "type": api_type,
         "url": config.get("url") or os.environ.get("AI_API_URL", ""),
-        "api_key": config.get("api_key") or os.environ.get("AI_API_KEY", ""),
+        "api_key": final_key,
         "model_name": config.get("model_name") or os.environ.get("AI_MODEL", default_model),
     }
 
@@ -265,7 +283,8 @@ def _call_gemini_api(system_prompt, user_text, api_config):
     """单次 Gemini API 调用，成功返回文本，失败返回 None。"""
     try:
         from google import genai
-        client = genai.Client(api_key=api_config.get("api_key", ""))
+        api_key = api_config.get("api_key", "")
+        client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=api_config.get("model_name", "gemini-2.0-flash"),
             contents=user_text,
@@ -279,7 +298,10 @@ def _call_gemini_api(system_prompt, user_text, api_config):
         content = getattr(response, "text", "") or ""
         return content.replace("**", "").strip() if content else None
     except Exception as e:
-        print(f"  Gemini API 调用失败: {e}")
+        err_str = str(e)
+        print(f"  Gemini API 调用失败: {err_str}")
+        if "API_KEY_INVALID" in err_str or "API key not valid" in err_str or "400 INVALID_ARGUMENT" in err_str:
+            print(f"  [Gemini 排错提示] 当前使用的 Key: {mask_api_key(api_config.get('api_key', ''))} 无效，请检查 GitHub Action Secret 配置！")
         return None
 
 

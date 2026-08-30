@@ -292,6 +292,16 @@ def translate_segment_local(segment_text):
         return None
 
 
+def mask_api_key(key):
+    """安全遮罩 API Key，避免在日志中泄露完整密钥。"""
+    if not key:
+        return "<EMPTY>"
+    key = str(key).strip()
+    if len(key) <= 8:
+        return key[:2] + "****" + key[-2:]
+    return key[:4] + "****" + key[-4:]
+
+
 def load_api_config(config_file=None, api_url=None, api_key=None, model_name=None, api_type=None):
     """加载 API 配置，优先级：显式参数 > 环境变量 > 配置文件 > 默认值。"""
     config = {}
@@ -304,7 +314,18 @@ def load_api_config(config_file=None, api_url=None, api_key=None, model_name=Non
 
     final_type = (api_type or os.environ.get("AI_API_TYPE") or config.get("type") or "openai").lower()
     final_url = api_url or os.environ.get("AI_API_URL") or config.get("url") or ""
-    final_key = api_key or os.environ.get("AI_API_KEY") or config.get("api_key") or ""
+    
+    # 支持多种环境变量与配置文件回退
+    raw_key = (
+        api_key
+        or (os.environ.get("GEMINI_API_KEY") if final_type == "gemini" else None)
+        or (os.environ.get("API_KEY_GEMINI") if final_type == "gemini" else None)
+        or (os.environ.get("API_KEY_gemini") if final_type == "gemini" else None)
+        or os.environ.get("AI_API_KEY")
+        or config.get("api_key")
+        or ""
+    )
+    final_key = str(raw_key).strip().strip("'\"") if raw_key else ""
     final_model = model_name or os.environ.get("AI_MODEL") or config.get("model_name") or ""
 
     if not final_model:
@@ -539,7 +560,16 @@ def translate_segment_gemini(segment_text, api_config, max_retries=5):
 
         except Exception as e:
             saw_server_error = True
-            print(f"  [Gemini] API 请求错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            err_str = str(e)
+            print(f"  [Gemini] API 请求错误 (尝试 {attempt + 1}/{max_retries}): {err_str}")
+            if "API_KEY_INVALID" in err_str or "API key not valid" in err_str or "400 INVALID_ARGUMENT" in err_str:
+                masked = mask_api_key(api_key)
+                print(f"  [Gemini 排错提示] Google API 拒绝了当前 Key: {masked} (字符长度: {len(api_key)})")
+                if api_key.startswith("sk-"):
+                    print("  [Gemini 排错提示] 检测到当前 Key 以 'sk-' 开头，这是 OpenAI/SiliconFlow 格式的 Key，而不是 Google Gemini Key！")
+                print("  [Gemini 排错提示] 解决步骤：")
+                print("    1. 请前往 Google AI Studio (https://aistudio.google.com/) 创建 Gemini API Key (通常以 AIzaSy 开头)")
+                print("    2. 在 GitHub 仓库 -> Settings -> Secrets and variables -> Actions 中添加或更新 Secret: API_KEY_GEMINI")
             continue
 
     # 5 次都失败：进入纠错阶段
@@ -865,7 +895,14 @@ def main():
         print(f"错误: {err_msg}")
         return 1
 
-    print(f"API 类型: {api_config['type']}, 模型: {api_config['model_name']}")
+    masked_key = mask_api_key(api_config.get("api_key", ""))
+    print(f"API 类型: {api_config['type']}, 模型: {api_config['model_name']}, Key: {masked_key} (长度: {len(api_config.get('api_key', ''))})")
+    if api_config['type'] == 'gemini':
+        key_str = api_config.get('api_key', '')
+        if key_str.startswith('sk-'):
+            print("  [警告] 当前为 Gemini 模式，但 API Key 以 'sk-' 开头（疑似 OpenAI/SiliconFlow 密钥），请检查 GitHub Action Secret 配置！")
+        elif not key_str.startswith('AIza') and key_str:
+            print("  [提示] Google Gemini API Key 通常以 'AIza' 开头")
 
     lines = read_lines(args.input)
     print(f"读取 {len(lines)} 行字幕")
