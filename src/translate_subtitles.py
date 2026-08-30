@@ -388,6 +388,10 @@ def translate_segment_openai(segment_text, api_config, max_retries=5):
                 delay = 1 * (2 ** (attempt - 1)) + random() * 0.5
                 time.sleep(delay)
             response = requests.post(url, json=data, headers=headers, timeout=60)
+            if response.status_code == 429:
+                print("  [OpenAI] 触发 429 速率限制，等待 60 秒后重试...")
+                time.sleep(60)
+                continue
             # 5xx 服务端错误：不立即返回，继续重试；累计到 max_retries 都失败后再走兜底
             if 500 <= response.status_code < 600:
                 saw_server_error = True
@@ -423,6 +427,10 @@ def translate_segment_openai(segment_text, api_config, max_retries=5):
 
         except requests.exceptions.RequestException as e:
             status = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+            if status == 429:
+                print("  [OpenAI] 触发 429 速率限制，等待 60 秒后重试...")
+                time.sleep(60)
+                continue
             if status is not None and 500 <= status < 600:
                 saw_server_error = True
                 print(f"  请求错误 {status} (尝试 {attempt + 1}/{max_retries}): {e}，将继续重试")
@@ -562,6 +570,10 @@ def translate_segment_gemini(segment_text, api_config, max_retries=5):
             saw_server_error = True
             err_str = str(e)
             print(f"  [Gemini] API 请求错误 (尝试 {attempt + 1}/{max_retries}): {err_str}")
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str or "limit" in err_str:
+                print("  [Gemini] 触发 429 速率限制或额度超限，等待 60 秒后重试...")
+                time.sleep(60)
+                continue
             if "API_KEY_INVALID" in err_str or "API key not valid" in err_str or "400 INVALID_ARGUMENT" in err_str:
                 masked = mask_api_key(api_key)
                 print(f"  [Gemini 排错提示] Google API 拒绝了当前 Key: {masked} (字符长度: {len(api_key)})")

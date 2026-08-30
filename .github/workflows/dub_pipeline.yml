@@ -307,7 +307,7 @@ jobs:
             --input work/word_level.txt \
             --output work/word_level_translated.txt \
             --api_config config/api_config.json \
-            --max_workers 4
+            --max_workers 2
 
       - name: 上传翻译产物
         uses: actions/upload-artifact@v4
