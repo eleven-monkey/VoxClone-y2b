@@ -81,7 +81,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-asr-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/asr.txt', 'requirements/common.txt') }}
+          key: pip-asr-${{ runner.os }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements/asr.txt', 'requirements/asr.constraints.txt', 'requirements/common.txt') }}
 
       - name: 缓存 HuggingFace 模型
         uses: actions/cache@v4
@@ -89,12 +89,70 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-models-asr-pyannote3-${{ runner.os }}
 
-      - name: 安装 ASR 依赖
+      - name: 安装 ASR 依赖（版本锁定）
         run: |
           pip install -r requirements/common.txt
-          # 参考 wshiperx colab 脚本：先装 torch CPU 版，再装 whisperx，避免 torchaudio 版本冲突
-          pip install "torch>=2.1,<2.6" "torchaudio>=2.1,<2.6" --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements/asr.txt
+          # whisperx 3.3.1 这套 2024 年的旧栈只兼容 torch/torchaudio 2.5.1：
+          #   - torchaudio 2.9 起删掉了 AudioMetaData，pyannote.audio 3.3.2 会直接 ImportError
+          #   - 2.5.1 也是 whisperx 3.3.1 官方 colab 使用的版本
+          # 先从 PyTorch CPU 源装死这两个包，再用 -c 约束后续解析，防止被顺手升级。
+          pip install -r requirements/asr.constraints.txt --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements/asr.txt \
+            -c requirements/asr.constraints.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: 校验 ASR 依赖版本
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          import re
+
+          def vkey(text):
+              parts = [int(x) for x in re.findall(r"\d+", text.split("+")[0])[:3]]
+              return tuple(parts + [0] * (3 - len(parts)))
+
+          # 精确版本：这套组合互相咬死，任何一项被升级都会在 import 阶段崩
+          exact = {
+              "torch": "2.5.1",
+              "torchaudio": "2.5.1",
+              "ctranslate2": "4.4.0",
+              "whisperx": "3.3.1",
+              "pyannote.audio": "3.3.2",
+              "faster-whisper": "1.1.0",
+          }
+          # 只卡上限：这些包抬高 torch 下限时会把 torch/torchaudio 一起拖上去
+          capped = {
+              "speechbrain": "1.1",
+              "lightning": "2.7",
+              "torchmetrics": "1.10",
+              "transformers": "4.38",
+          }
+
+          def installed(name):
+              try:
+                  return md.version(name)
+              except md.PackageNotFoundError:
+                  return "<未安装>"
+
+          bad = []
+          for name, want in exact.items():
+              got = installed(name)
+              ok = got.split("+")[0] == want
+              print(f"{name:16s} {got:16s} {'OK' if ok else '应为 ' + want}")
+              if not ok:
+                  bad.append(f"{name}={got} (应为 {want})")
+
+          for name, cap in capped.items():
+              got = installed(name)
+              ok = got != "<未安装>" and vkey(got) < vkey(cap)
+              print(f"{name:16s} {got:16s} {'OK' if ok else '应 < ' + cap}")
+              if not ok:
+                  bad.append(f"{name}={got} (应 < {cap})")
+
+          if bad:
+              raise SystemExit("依赖版本被解析升级了，请检查 requirements/asr.txt 约束: " + "; ".join(bad))
+          print("ASR 依赖版本校验通过")
+          PY
 
       # whisperx==3.3.1 强制依赖 ctranslate2<4.5.0（实装 4.4.0），该版本的 Linux wheel
       # 在 PT_GNU_STACK 中声明了“可执行栈”。glibc >= 2.41（Ubuntu 24.04/26.04 等新 runner）

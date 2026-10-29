@@ -1,5 +1,29 @@
+# whisperx 3.3.1（2024-11）是一套整体强耦合的旧栈，任何一处被 pip 顺手升级都会在
+# import 阶段直接崩，所以这里把关键组件的版本/上限全部钉住，不要随意放宽：
+#
+#   1) pyannote.audio 3.3.2 依赖 torchaudio.AudioMetaData，而 torchaudio 2.9 起已删除该属性
+#      → AttributeError: module 'torchaudio' has no attribute 'AudioMetaData'
+#   2) whisperx 3.3.1 钉死 ctranslate2<4.5.0（实装 4.4.0），4.4.0 的 Linux wheel 在
+#      PT_GNU_STACK 里声明了可执行栈，glibc >= 2.41 会拒绝加载
+#      → ImportError: ... cannot enable executable stack as shared object requires
+#      （4.6.0 起官方已修复，但升级 ctranslate2 会破坏 faster-whisper 1.1.0 的兼容性）
+#
+# torch / torchaudio 的精确版本锁在 requirements/asr.constraints.txt（需 PyTorch CPU 源）。
 whisperx==3.3.1
-pyannote.audio>=3.3.0,<4.0.0
+faster-whisper==1.1.0
+ctranslate2==4.4.0
+pyannote.audio==3.3.2
+
+# 以下是被 pyannote.audio 以“无上限”方式依赖的包，它们一旦抬高 torch 下限，
+# pip 就会为了装新版把它们连带把 torch/torchaudio 一起升级（2026-10 的事故就是这样来的：
+# speechbrain 1.1.2 要求 torch>=2.7.1）。因此统一加版本上限。
+#   speechbrain 1.1.2 (2026-10-14) → torch>=2.7.1 / torchaudio>=2.7.1
+#   transformers 5.x            → 还需要 huggingface_hub>=0.34，与本文件 hub<0.21 冲突
+speechbrain>=1.0.0,<1.1
+lightning>=2.0.1,<2.7
+torchmetrics>=0.11,<1.10
+transformers>=4.30,<4.38
+
 huggingface_hub>=0.20,<0.21
 numpy>=1.24,<2.1
 pandas>=2.0,<2.4

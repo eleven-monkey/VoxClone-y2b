@@ -1,0 +1,14 @@
+# PyTorch 版本约束（配合 --index-url / --extra-index-url https://download.pytorch.org/whl/cpu 使用）
+#
+# 为什么必须锁死 2.5.1：
+#   - torchaudio 2.9 起删除了 torchaudio.AudioMetaData（以及旧的 backend 模块），
+#     而 pyannote.audio 3.3.2 在 core/io.py 里就直接用 torchaudio.AudioMetaData 做类型注解，
+#     一旦被解析成 2.9+，import whisperx 会在 import pyannote.audio 时直接崩：
+#       AttributeError: module 'torchaudio' has no attribute 'AudioMetaData'
+#   - 2.5.1 是 whisperx 3.3.1 官方 colab 环境使用的版本，也是这套旧栈唯一验证过的组合。
+#
+# 这个文件同时用于：
+#   1) 预装 torch/torchaudio（pip install -r requirements/asr.constraints.txt --index-url .../cpu）
+#   2) 作为 -c 约束传给后续的 pip install，防止解析时被悄悄升级
+torch==2.5.1
+torchaudio==2.5.1
