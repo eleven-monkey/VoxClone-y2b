@@ -50,8 +50,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: 安装 ffmpeg + patchelf
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg patchelf
 
       - name: 安装 Deno（YouTube JS 解密）
         run: |
@@ -95,6 +95,74 @@ jobs:
           # 参考 wshiperx colab 脚本：先装 torch CPU 版，再装 whisperx，避免 torchaudio 版本冲突
           pip install "torch>=2.1,<2.6" "torchaudio>=2.1,<2.6" --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements/asr.txt
+
+      # whisperx==3.3.1 强制依赖 ctranslate2<4.5.0（实装 4.4.0），该版本的 Linux wheel
+      # 在 PT_GNU_STACK 中声明了“可执行栈”。glibc >= 2.41（Ubuntu 24.04/26.04 等新 runner）
+      # 会拒绝 dlopen 这类 .so，报：
+      #   ImportError: libctranslate2-*.so.4.4.0: cannot enable executable stack as
+      #   shared object requires: Invalid argument
+      # ctranslate2 4.6.0 起官方已修复（OpenNMT/CTranslate2#1852），但 whisperx 3.3.1
+      # 的版本约束不允许升级，因此这里用 patchelf 直接清除该标志。
+      - name: 修复 CTranslate2 可执行栈标志（glibc >= 2.41 兼容）
+        run: |
+          python - <<'PY'
+          import os
+          import site
+          import subprocess
+          import sysconfig
+
+          roots = set()
+          for key in ("purelib", "platlib"):
+              path = sysconfig.get_paths().get(key)
+              if path:
+                  roots.add(path)
+          try:
+              roots.add(site.getusersitepackages())
+          except Exception:
+              pass
+          try:
+              roots.update(site.getsitepackages())
+          except Exception:
+              pass
+
+          targets = []
+          for root in roots:
+              if not root or not os.path.isdir(root):
+                  continue
+              for dirpath, _dirnames, filenames in os.walk(root):
+                  in_bundle = os.path.basename(dirpath) == "ctranslate2.libs"
+                  for name in filenames:
+                      if name.startswith("libctranslate2") and ".so" in name:
+                          targets.append(os.path.join(dirpath, name))
+                      elif in_bundle and ".so" in name:
+                          targets.append(os.path.join(dirpath, name))
+
+          targets = sorted(set(targets))
+          if not targets:
+              print("未找到 ctranslate2 动态库，跳过（可能未安装或已是修复后的版本）")
+              raise SystemExit(0)
+
+          bad = False
+          for path in targets:
+              print(f"处理: {path}")
+              subprocess.run(["patchelf", "--clear-execstack", path], check=True)
+              probe = subprocess.run(
+                  ["patchelf", "--print-execstack", path],
+                  capture_output=True, text=True, check=False,
+              )
+              out = (probe.stdout or "").strip()
+              if probe.returncode != 0:
+                  print(f"  无法回读状态（patchelf 版本较旧？）：{probe.stderr.strip()}")
+              else:
+                  print(f"  当前状态: {out or '(空)'}")
+                  if out.lower().endswith("true"):
+                      bad = True
+          raise SystemExit(1 if bad else 0)
+          PY
+
+      - name: 验证 CTranslate2 可以正常导入
+        run: |
+          python -c "import ctranslate2; print('ctranslate2 OK:', ctranslate2.__version__)"
 
       - name: 下载音频
         env:

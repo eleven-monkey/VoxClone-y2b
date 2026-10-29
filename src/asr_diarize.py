@@ -216,7 +216,20 @@ def run_asr_diarize(audio_path, hf_token, output_dir, max_speakers=None, languag
               （WhisperX 自动检测常把英语误判为 cy 等小语种，导致无对齐模型）。
     """
     import torch
-    import whisperx
+    try:
+        import whisperx
+    except ImportError as exc:
+        if "executable stack" in str(exc):
+            raise ImportError(
+                f"{exc}\n\n"
+                "这是 ctranslate2 4.4.0 的 Linux wheel 与 glibc >= 2.41（Ubuntu 24.04+）不兼容导致的：\n"
+                "  该 .so 在 PT_GNU_STACK 中声明了可执行栈，新版 glibc 会拒绝 dlopen。\n"
+                "修复方式（在安装依赖后执行一次）：\n"
+                "  sudo apt-get install -y patchelf\n"
+                "  patchelf --clear-execstack <site-packages 下的 libctranslate2-*.so.4.4.0>\n"
+                "本仓库 .github/workflows/dub_pipeline.yml 的 asr job 已自动完成上述处理。"
+            ) from exc
+        raise
     from whisperx.diarize import DiarizationPipeline
 
     device = "cpu"
